@@ -21,7 +21,7 @@ int main(void) {
 
     uint8_t header = 0xAB;
     uint8_t payload[507];
-    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = i & 0xFF;
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = 12;
 
     printf("Writing test sector...\n");
     uint8_t rc = save_u8bit_values(payload, sizeof(payload), &header);
@@ -32,7 +32,7 @@ int main(void) {
 
     printf("✅ Write OK, verifying data...\n");
     uint8_t buffer[512];
-    active_driver->read_block(active_driver, 1, buffer);
+    active_driver->read_block(active_driver, 2, buffer);
 
     printf("First 16 bytes of sector 1: ");
     for (int i = 0; i < 16; i++)
