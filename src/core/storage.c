@@ -1,6 +1,7 @@
 #include "storage.h"
 #include "driver.h"
 #include "helper.h"
+#include "config.h"
 
 #include <stdint.h>
 #include <stdio.h>
