@@ -14,6 +14,8 @@ typedef struct driver {
     const char *name;        ///< Human-readable identifier (e.g. "sd", "linux", "mock")
     uint32_t sector_size;    ///< Usually 512 bytes; can differ for advanced devices
     void *ctx;               ///< Optional context pointer (e.g. FILE* or SPI handle)
+    uint64_t total_size_bytes;
+    uint64_t total_sectors;
 
     int  (*init)(struct driver *self);
     int  (*read_block)(struct driver *self, uint32_t lba, uint8_t *buffer);
