@@ -5,8 +5,8 @@ CFLAGS = -Wall -Wextra -std=c11 -O2 \
          -I./core \
          -I./include
 
-SRC = main.c ./core/storage.c ./drivers/linux/linux_driver.c
-OUT = myfs_test
+SRC = main.c ./core/storage.c ./core/helper.c ./core/config.c ./drivers/linux/linux_driver.c
+OUT = zinf
 
 all:
 	$(CC) $(CFLAGS) $(SRC) -o $(OUT)

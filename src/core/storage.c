@@ -1,5 +1,8 @@
 #include "storage.h"
 #include "driver.h"
+#include "helper.h"
+#include "config.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -21,21 +24,6 @@
 /* Global driver pointer (assigned externally, e.g. from main.c) */
 extern driver_t *active_driver;
 extern uint32_t log_sector;
-
-/*### HELPERS ###*/
-uint32_t crc32_u8bit(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc ^ 0xFFFFFFFF;
-}
 
 /*### DRIVER HELPERS ###*/
 static int read_sector(uint32_t sector, uint8_t *buffer) {
@@ -196,7 +184,7 @@ uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
         }
 
         // CRC
-        uint32_t crc = crc32_u8bit(sector_buffer, HEADER_SIZE + PAYLOAD_SIZE);
+        uint32_t crc = crc32(sector_buffer, HEADER_SIZE + PAYLOAD_SIZE);
         sector_buffer[508] = (uint8_t)(crc & 0xFF);
         sector_buffer[509] = (uint8_t)((crc >> 8) & 0xFF);
         sector_buffer[510] = (uint8_t)((crc >> 16) & 0xFF);
