@@ -35,6 +35,19 @@ int main(void) {
     }
 
     printf("Write OK\n");
+
+    printf("Writing test sector...\n");
+    header = 0xBC;
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = 6;
+
+    rc = raid_u8bit_values(payload, sizeof(payload), &header);
+    if (rc != 0) {
+        printf("save_u8bit_values failed (%d)\n", rc);
+        return 1;
+    }
+
+    printf("Write OK\n");
+
     /*uint8_t buffer[512];
     active_driver->read_block(active_driver, 2, buffer);
 
@@ -46,4 +59,3 @@ int main(void) {
     active_driver->deinit(active_driver);
     return 0;
 }
-
