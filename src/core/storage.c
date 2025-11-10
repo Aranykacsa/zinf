@@ -8,17 +8,18 @@
 #include <stddef.h>
 
 /* ---- Return codes ---- */
-#define STORAGE_OK            10
-#define STORAGE_ERR_DRIVER    11
-#define STORAGE_ERR_PARAM     12
-#define STORAGE_ERR_FULL      13
-#define STORAGE_ERR_LOG_FULL  14
+#define STORAGE_OK            0
+#define STORAGE_ERR_DRIVER    1
+#define STORAGE_ERR_PARAM     2
+#define STORAGE_ERR_FULL      3
+#define STORAGE_ERR_LOG_FULL  4
 
 #define SECTOR_SIZE 512
-#define CRC_SIZE 4
+#define CRC_SIZE 4 // 32 bit
 #define HEADER_SIZE 1
 #define PAYLOAD_SIZE (SECTOR_SIZE - CRC_SIZE - HEADER_SIZE)
 #define RAID_MIRRORS 3
+#define RAID_OFFSET 30
 
 /* Global driver pointer (assigned externally, e.g. from main.c) */
 extern driver_t *active_driver;

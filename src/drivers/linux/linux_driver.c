@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 
 typedef struct {
     int fd;
@@ -19,6 +21,20 @@ static int linux_init(driver_t *self) {
         perror("[linux_driver] open");
         return DRIVER_ERR_INIT;
     }
+
+    uint64_t bytes = 0;
+    if (ioctl(ctx->fd, BLKGETSIZE64, &bytes) == -1) {
+        perror("[linux_driver] ioctl(BLKGETSIZE64)");
+        self->total_size_bytes = 0;
+        self->total_sectors = 0;
+    } else {
+        self->total_size_bytes = bytes;
+        self->total_sectors = bytes / self->sector_size;
+        printf("[linux_driver] Detected size: %.2f MB (%lu sectors)\n",
+               bytes / (1024.0 * 1024.0),
+               (unsigned long)self->total_sectors);
+    }
+
     printf("[linux_driver] Opened %s\n", ctx->path);
     return DRIVER_OK;
 }
@@ -53,7 +69,7 @@ static void linux_deinit(driver_t *self) {
 
 static linux_ctx_t ctx = {
     .fd = -1,
-    .path = "/dev/loop6"   // change if your loopback differs
+    .path = "/dev/loop0"   // change if your loopback differs
 };
 
 driver_t linux_driver = {

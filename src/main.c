@@ -6,15 +6,19 @@
 extern driver_t linux_driver;
 driver_t *active_driver = &linux_driver;
 uint32_t log_sector = 0;  // global required by storage.c
+uint8_t status;
 
 int main(void) {
     printf("=== MyFS Desktop Test ===\n");
-    if (setup_storage() != 10) {
+
+    status = setup_storage();
+    if (status != 0) {
         printf("Storage init failed.\n");
         return 1;
     }
 
-    if (init_log_sector() != 10) {
+    status = init_log_sector();
+    if (status != 0) {
         printf("Failed to init log sector.\n");
         return 1;
     }
@@ -25,7 +29,7 @@ int main(void) {
 
     printf("Writing test sector...\n");
     uint8_t rc = raid_u8bit_values(payload, sizeof(payload), &header);
-    if (rc != 10) {
+    if (rc != 0) {
         printf("save_u8bit_values failed (%d)\n", rc);
         return 1;
     }
