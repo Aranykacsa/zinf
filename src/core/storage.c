@@ -34,67 +34,118 @@ static int write_sector(uint32_t sector, const uint8_t *buffer) {
 }
 
 /*### INTERNAL STATE FUNCTIONS ###*/
+/* === INTERNAL STATE FUNCTIONS WITH CRC === */
 uint8_t get_last_sector(uint32_t *last_sector) {
-  if (!last_sector)
-    return STORAGE_ERR_PARAM;
+    if (!last_sector) return STORAGE_ERR_PARAM;
 
-  uint8_t buffer_1[SECTOR_SIZE];
-  uint8_t buffer_2[SECTOR_SIZE];
-  uint8_t buffer_3[SECTOR_SIZE];
+    uint8_t  buffer[3][SECTOR_SIZE];
+    uint32_t value[3];
+    uint8_t  valid[3] = {0};
 
-  uint32_t last_sector_1;
-  uint32_t last_sector_2;
-  uint32_t last_sector_3;
+    for (uint8_t i = 0; i < RAID_MIRRORS; i++) {
+        uint32_t meta_sector = log_sector + (i * RAID_OFFSET);
+        int rc = read_sector(meta_sector, buffer[i]);
+        if (rc != DRIVER_OK) continue;
 
-  int8_t rc = read_sector(log_sector, buffer_1);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+        uint32_t stored_crc =
+              ((uint32_t)buffer[i][SECTOR_SIZE-4])
+            | ((uint32_t)buffer[i][SECTOR_SIZE-3] << 8)
+            | ((uint32_t)buffer[i][SECTOR_SIZE-2] << 16)
+            | ((uint32_t)buffer[i][SECTOR_SIZE-1] << 24);
 
-  rc = read_sector(log_sector + (1 * RAID_OFFSET), buffer_2);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+        uint32_t calc_crc = crc32(buffer[i], SECTOR_SIZE - 4);
+        if (stored_crc == calc_crc) {
+            value[i] = ((uint32_t)buffer[i][0])
+                     | ((uint32_t)buffer[i][1] << 8)
+                     | ((uint32_t)buffer[i][2] << 16);
+            valid[i] = 1;
+        } else {
+            printf("[META] mirror %u CRC mismatch\n", i);
+        }
+    }
 
-  rc = read_sector(log_sector + (2 * RAID_OFFSET), buffer_3);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+    // choose majority or any valid copy
+    uint8_t valid_count = valid[0] + valid[1] + valid[2];
+    if (valid_count == 0) return STORAGE_ERR_META;
 
-  last_sector_1 = ((uint32_t)buffer_1[0]) | ((uint32_t)buffer_1[1] << 8) |
-                  ((uint32_t)buffer_1[2] << 16);
-  last_sector_2 = ((uint32_t)buffer_2[0]) | ((uint32_t)buffer_2[1] << 8) |
-                  ((uint32_t)buffer_2[2] << 16);
-  last_sector_3 = ((uint32_t)buffer_3[0]) | ((uint32_t)buffer_3[1] << 8) |
-                  ((uint32_t)buffer_3[2] << 16);
+    uint32_t candidate = 0;
+    if (valid[0] && valid[1] && value[0] == value[1]) candidate = value[0];
+    else if (valid[1] && valid[2] && value[1] == value[2]) candidate = value[1];
+    else if (valid[0] && valid[2] && value[0] == value[2]) candidate = value[0];
+    else if (valid[0]) candidate = value[0];
+    else if (valid[1]) candidate = value[1];
+    else candidate = value[2];
 
-  if (last_sector_1 == last_sector_2 && last_sector_2 == last_sector_3) {
-    *last_sector = last_sector_1;
+    *last_sector = candidate;
     return STORAGE_OK;
-  } else
-    return STORAGE_ERR_META;
 }
 
+
 uint8_t set_last_sector(const uint32_t *last_sector) {
-  if (!last_sector)
-    return STORAGE_ERR_PARAM;
+    if (!last_sector) return STORAGE_ERR_PARAM;
 
-  uint8_t buffer[SECTOR_SIZE];
-  int rc = read_sector(log_sector, buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+    uint8_t buffer[SECTOR_SIZE];
+    int rc = read_sector(log_sector, buffer);
+    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
 
-  buffer[0] = (uint8_t)(*last_sector & 0xFF);
-  buffer[1] = (uint8_t)((*last_sector >> 8) & 0xFF);
-  buffer[2] = (uint8_t)((*last_sector >> 16) & 0xFF);
+    // update value
+    buffer[0] = (uint8_t)(*last_sector & 0xFF);
+    buffer[1] = (uint8_t)((*last_sector >> 8) & 0xFF);
+    buffer[2] = (uint8_t)((*last_sector >> 16) & 0xFF);
 
-  rc = write_sector(log_sector, buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+    // recompute CRC
+    uint32_t crc = crc32(buffer, SECTOR_SIZE - 4);
+    buffer[SECTOR_SIZE-4] = (uint8_t)(crc & 0xFF);
+    buffer[SECTOR_SIZE-3] = (uint8_t)((crc >> 8) & 0xFF);
+    buffer[SECTOR_SIZE-2] = (uint8_t)((crc >> 16) & 0xFF);
+    buffer[SECTOR_SIZE-1] = (uint8_t)((crc >> 24) & 0xFF);
 
-  rc = write_sector(log_sector + (1 * RAID_OFFSET), buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
+    // write all mirrors
+    for (uint8_t i = 0; i < RAID_MIRRORS; i++) {
+        uint32_t meta_sector = log_sector + (i * RAID_OFFSET);
+        rc = write_sector(meta_sector, buffer);
+        if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    }
 
-  rc = write_sector(log_sector + (2 * RAID_OFFSET), buffer);
-  return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
+    if (active_driver->sync) active_driver->sync(active_driver);
+    return STORAGE_OK;
+}
+
+
+uint8_t init_log_sector(void) {
+    RAID_OFFSET = (uint32_t)floor(active_driver->total_sectors / RAID_MIRRORS);
+    if (RAID_OFFSET == 0) return STORAGE_ERR_PARAM;
+    printf("RAID_OFFSET: %u\n", RAID_OFFSET);
+
+    // prepare zeroed metadata
+    uint8_t buffer[SECTOR_SIZE];
+    for (uint16_t i = 0; i < SECTOR_SIZE; i++) buffer[i] = 0;
+
+    const uint32_t start_sector = 1;
+    const uint16_t last_msg = 0;
+    buffer[0] = (uint8_t)(start_sector & 0xFF);
+    buffer[1] = (uint8_t)((start_sector >> 8) & 0xFF);
+    buffer[2] = (uint8_t)((start_sector >> 16) & 0xFF);
+    buffer[3] = (uint8_t)(last_msg & 0xFF);
+    buffer[4] = (uint8_t)((last_msg >> 8) & 0xFF);
+    buffer[5] = 0; // not full
+
+    // compute CRC
+    uint32_t crc = crc32(buffer, SECTOR_SIZE - 4);
+    buffer[SECTOR_SIZE-4] = (uint8_t)(crc & 0xFF);
+    buffer[SECTOR_SIZE-3] = (uint8_t)((crc >> 8) & 0xFF);
+    buffer[SECTOR_SIZE-2] = (uint8_t)((crc >> 16) & 0xFF);
+    buffer[SECTOR_SIZE-1] = (uint8_t)((crc >> 24) & 0xFF);
+
+    // write to all mirrors
+    for (uint8_t i = 0; i < RAID_MIRRORS; i++) {
+        uint32_t meta_sector = log_sector + (i * RAID_OFFSET);
+        int rc = write_sector(meta_sector, buffer);
+        if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    }
+
+    if (active_driver->sync) active_driver->sync(active_driver);
+    return STORAGE_OK;
 }
 
 /*### PUBLIC API ###*/
@@ -270,45 +321,5 @@ uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header,
 
   // hand back next-free sector in this mirror slice
   *start_raid_sector = target;
-  return STORAGE_OK;
-}
-
-/* First 3 bytes => last sector; 4th–5th => last log; 6th => first log full */
-uint8_t init_log_sector(void) {
-  uint8_t buffer[SECTOR_SIZE];
-  for (uint16_t i = 0; i < SECTOR_SIZE; i++)
-    buffer[i] = 0;
-
-  int rc = write_sector(log_sector + 1, buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
-
-  for (uint16_t i = 0; i < SECTOR_SIZE; i++)
-    buffer[i] = 0;
-
-  const uint32_t start_sector = 1;
-  const uint16_t last_msg = 0;
-
-  buffer[0] = (uint8_t)(start_sector & 0xFF);
-  buffer[1] = (uint8_t)((start_sector >> 8) & 0xFF);
-  buffer[2] = (uint8_t)((start_sector >> 16) & 0xFF);
-  buffer[3] = (uint8_t)(last_msg & 0xFF);
-  buffer[4] = (uint8_t)((last_msg >> 8) & 0xFF);
-
-  RAID_OFFSET = (uint32_t)floor(active_driver->total_sectors / RAID_MIRRORS);
-  printf("RAID_OFFSET: %u\n", RAID_OFFSET);
-
-  rc = write_sector(log_sector, buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
-
-  rc = write_sector(log_sector + (1 * RAID_OFFSET), buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
-
-  rc = write_sector(log_sector + (2 * RAID_OFFSET), buffer);
-  if (rc != DRIVER_OK)
-    return STORAGE_ERR_DRIVER;
-
   return STORAGE_OK;
 }
