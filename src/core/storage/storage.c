@@ -17,21 +17,7 @@
 #define STORAGE_ERR_META 5
 
 /* Global driver pointer (assigned externally, e.g. from main.c) */
-extern driver_t *active_driver;
 extern uint32_t log_sector;
-
-/*### DRIVER HELPERS ###*/
-static int read_sector(uint32_t sector, uint8_t *buffer) {
-  if (!active_driver || !buffer)
-    return STORAGE_ERR_PARAM;
-  return active_driver->read_block(active_driver, sector, buffer);
-}
-
-static int write_sector(uint32_t sector, const uint8_t *buffer) {
-  if (!active_driver || !buffer)
-    return STORAGE_ERR_PARAM;
-  return active_driver->write_block(active_driver, sector, buffer);
-}
 
 /*### INTERNAL STATE FUNCTIONS ###*/
 /* === INTERNAL STATE FUNCTIONS WITH CRC === */
@@ -153,17 +139,6 @@ uint8_t setup_storage(void) {
   int rc = active_driver->init(active_driver);
   printf("[STORAGE] init: %d\r\n", rc);
   return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
-}
-
-uint8_t test_save_msg(void) {
-  uint8_t err;
-  uint8_t msg = 5;
-  for (uint32_t i = 0; i < 1024; i++) {
-    err = save_msg(&msg);
-    if (err != STORAGE_OK)
-      return err;
-  }
-  return STORAGE_OK;
 }
 
 uint8_t save_msg(uint8_t *msg) {
