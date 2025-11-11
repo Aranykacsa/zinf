@@ -48,14 +48,6 @@ int main(void) {
 
     printf("Write OK\n");
 
-    /*uint8_t buffer[512];
-    active_driver->read_block(active_driver, 2, buffer);
-
-    printf("First 16 bytes of sector 1: ");
-    for (int i = 0; i < 16; i++)
-        printf("%02X ", buffer[i]);
-    printf("\n");*/
-
     active_driver->deinit(active_driver);
     return 0;
 }
