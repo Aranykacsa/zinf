@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stddef.h>
-#include <string.h>
 
 /* ---- Return codes ---- */
 #define STORAGE_OK            0
@@ -161,7 +160,7 @@ uint8_t save_msg(uint8_t *msg) {
     return STORAGE_OK;
 }
 
-/*uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
+uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     uint8_t rc;
     for (uint8_t i = 0; i < RAID_MIRRORS; i++) {
         rc = save_u8bit_values(buffer, len, header);
@@ -169,68 +168,6 @@ uint8_t save_msg(uint8_t *msg) {
     }
     return STORAGE_OK;
 }*/
-
-uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
-    if (!buffer) return STORAGE_ERR_PARAM;
-    // Strict 507 byte alignment check
-    if (len % PAYLOAD_SIZE != 0) return STORAGE_ERR_PARAM;
-
-    // 1. READ POINTER ONCE
-    // We assume Mirror 1 is the "Master" for the pointer. 
-    // In a full implementation, you would read all 3 and vote.
-    uint32_t current_log_index = 0;
-    uint8_t rc = get_last_sector(&current_log_index);
-    if (rc != STORAGE_OK) return rc;
-
-    uint16_t num_chunks = len / PAYLOAD_SIZE;
-    uint32_t write_cursor = current_log_index;
-
-    // Single buffer for the sector to reduce stack usage
-    uint8_t sector_buffer[SECTOR_SIZE];
-
-    // 2. LOOP THROUGH CHUNKS
-    for (uint16_t i = 0; i < num_chunks; i++) {
-        write_cursor++; // Move to next sector slot
-
-        // --- A. PREPARE SECTOR (Do this only ONCE per chunk) ---
-        memset(sector_buffer, 0, SECTOR_SIZE);
-        
-        // Header
-        sector_buffer[0] = *header;
-        
-        // Payload copy
-        // Optimize: memcpy is faster than a loop
-        memcpy(&sector_buffer[1], &buffer[i * PAYLOAD_SIZE], PAYLOAD_SIZE);
-
-        // CRC Calculation (CPU expensive part - done only ONCE now)
-        uint32_t crc = crc32_u8bit(sector_buffer, HEADER_SIZE + PAYLOAD_SIZE);
-        sector_buffer[508] = (uint8_t)(crc & 0xFF);
-        sector_buffer[509] = (uint8_t)((crc >> 8) & 0xFF);
-        sector_buffer[510] = (uint8_t)((crc >> 16) & 0xFF);
-        sector_buffer[511] = (uint8_t)((crc >> 24) & 0xFF);
-
-        // --- B. WRITE TO ALL MIRRORS (Interleaved) ---
-        for (uint8_t m = 0; m < RAID_MIRRORS; m++) {
-            // Calculate physical address for this mirror
-            // Mirror 0: sector X
-            // Mirror 1: sector X + RAID_OFFSET
-            // Mirror 2: sector X + (2 * RAID_OFFSET)
-            uint32_t physical_sector = write_cursor + (m * RAID_OFFSET);
-
-            int drv_rc = active_driver->write_block(active_driver, physical_sector, sector_buffer);
-            
-            // Critical safety: If a mirror fails, do we stop? 
-            // ZINF thesis says we prioritize consistency. For now, return error.
-            if (drv_rc != 0) return STORAGE_ERR_DRIVER;
-        }
-    }
-
-    // 3. UPDATE POINTER (Metadata)
-    // Update the metadata block to point to the new end of the chain
-    rc = set_last_sector(&write_cursor);
-    
-    return rc;
-}
 
 uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     if (!buffer) return STORAGE_ERR_PARAM;

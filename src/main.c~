@@ -1,0 +1,104 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+
+/* --- ZINF INCLUDES --- */
+#include "driver.h"
+#include "storage.h"
+
+/* --- GLOBALS --- */
+extern driver_t linux_driver;
+driver_t *active_driver = &linux_driver;
+uint32_t log_sector = 0; 
+uint8_t status;
+
+// Helper for nanosecond timing
+uint64_t get_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// Reset "Disk" state to ensure consistent tests
+void reset_zinf() {
+    if (active_driver->deinit) active_driver->deinit(active_driver);
+    log_sector = 0;
+    setup_storage();
+    init_log_sector();
+}
+
+int main(void) {
+    // CSV Header: compatible with the Python script below
+    // We output: BlockSize, TotalTime(s), AvgSpeed(KB/s), MaxLatency(us), MinLatency(us)
+    printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,Efficiency_Percent\n");
+
+    // Test payload sizes corresponding to different sensor structs
+    // 14 bytes (Example from thesis page 35) up to larger structs
+    int PAYLOAD_SIZES[] = {14, 32, 64, 128, 256, 500}; 
+    int NUM_TESTS = sizeof(PAYLOAD_SIZES) / sizeof(PAYLOAD_SIZES[0]);
+    
+    // Total amount of payload data to attempt to write per test (e.g. 512KB)
+    const int TARGET_TOTAL_BYTES = 512 * 1024; 
+
+    uint8_t header = 0x01; // Block type ID [cite: 524]
+    uint8_t *buffer = malloc(1024);
+
+    for (int i = 0; i < NUM_TESTS; i++) {
+        int payload_size = PAYLOAD_SIZES[i];
+        
+        reset_zinf(); // Start fresh for each size
+        memset(buffer, 0xAA, payload_size);
+
+        int records_written = 0;
+        int total_bytes_payload = 0;
+        
+        uint64_t start_bench = get_time_ns();
+        uint64_t max_latency = 0;
+        uint64_t min_latency = 999999999;
+        uint64_t total_latency = 0;
+
+        while (total_bytes_payload < TARGET_TOTAL_BYTES) {
+            uint64_t t0 = get_time_ns();
+            
+            // The Core ZINF Write Call
+            uint8_t rc = raid_u8bit_values(buffer, payload_size, &header);
+            
+            uint64_t t1 = get_time_ns();
+            uint64_t latency = t1 - t0;
+
+            if (rc != 0) break; // Disk full or error
+
+            if (latency > max_latency) max_latency = latency;
+            if (latency < min_latency) min_latency = latency;
+            total_latency += latency;
+
+            total_bytes_payload += payload_size;
+            records_written++;
+        }
+        
+        uint64_t end_bench = get_time_ns();
+        double duration_sec = (end_bench - start_bench) / 1e9;
+
+        // Metrics
+        double throughput_kbps = (total_bytes_payload / 1024.0) / duration_sec;
+        double avg_latency_us = (total_latency / (double)records_written) / 1000.0;
+        double max_latency_us = max_latency / 1000.0;
+        
+        // Theoretical Efficiency Calculation based on Thesis Page 35 [cite: 562]
+        // Assuming 512B sectors and 1 mirror for simplicity in this Calc
+        // This calculates Payload / (Physical writes) roughly
+        // You can adjust this math to match your specific RAID implementation
+        double efficiency = 100.0; // Placeholder, calculated better in Python if needed
+
+        fprintf(stderr, "Tested Payload %d: %.2f KB/s | Max Lat: %.2f us\n", 
+                payload_size, throughput_kbps, max_latency_us);
+
+        printf("%d,%.2f,%.2f,%.2f,%.2f\n", 
+               payload_size, throughput_kbps, max_latency_us, avg_latency_us, efficiency);
+    }
+
+    free(buffer);
+    return 0;
+}
