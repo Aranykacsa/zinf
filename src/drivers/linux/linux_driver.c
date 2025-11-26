@@ -82,4 +82,3 @@ driver_t linux_driver = {
     .sync = linux_sync,
     .deinit = linux_deinit
 };
-

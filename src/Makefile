@@ -1,12 +1,20 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -O2 \
+CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
+         -std=c11 -O2 \
          -I./drivers \
-         -I./drivers/linux \
+         -I./config \
          -I./core \
+         -I./core/storage \
+         -I./core/helper \
+         -I./drivers/linux \
          -I./include
 
-SRC = main.c ./core/storage.c ./drivers/linux/linux_driver.c
-OUT = myfs_test
+
+SRC = main.c \
+    $(wildcard core/**/*.c) \
+    $(wildcard config/*.c) \
+    $(wildcard drivers/linux/*.c)
+OUT = zinf
 
 all:
 	$(CC) $(CFLAGS) $(SRC) -o $(OUT)
@@ -16,4 +24,3 @@ run: all
 
 clean:
 	rm -f $(OUT)
-

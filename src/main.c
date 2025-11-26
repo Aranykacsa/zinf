@@ -114,7 +114,41 @@ int main(void) {
                 num_chunks, write_size, speed_kbps, max_lat);
     }
 
+<<<<<<< HEAD
     free(buffer);
+=======
+    status = init_log_sector();
+    if (status != 0) {
+        printf("Failed to init log sector.\n");
+        return 1;
+    }
+
+    uint8_t header = 0xAB;
+    uint8_t payload[507];
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = 12;
+
+    printf("Writing test sector...\n");
+    uint8_t rc = raid_u8bit_values(payload, sizeof(payload), &header);
+    if (rc != 0) {
+        printf("save_u8bit_values failed (%d)\n", rc);
+        return 1;
+    }
+
+    printf("Write OK\n");
+
+    printf("Writing test sector...\n");
+    header = 0xBC;
+    for (size_t i = 0; i < sizeof(payload); i++) payload[i] = 6;
+
+    rc = raid_u8bit_values(payload, sizeof(payload), &header);
+    if (rc != 0) {
+        printf("save_u8bit_values failed (%d)\n", rc);
+        return 1;
+    }
+
+    printf("Write OK\n");
+
+>>>>>>> d4584e51458acefd4478c6341845f2c99d88127a
     active_driver->deinit(active_driver);
     return 0;
 }
