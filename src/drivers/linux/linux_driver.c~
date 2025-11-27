@@ -66,7 +66,7 @@ static void linux_deinit(driver_t *self) {
     ctx->fd = -1;
     printf("[linux_driver] Closed device\n");
 }
-// Opcionális multi-read implementáció
+/ Opcionális multi-read implementáció
 static int linux_read_mult(driver_t *self, uint32_t lba, uint8_t *buf, uint32_t count) {
     linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
     if (!buf) return DRIVER_ERR_PARAM;
@@ -76,6 +76,14 @@ static int linux_read_mult(driver_t *self, uint32_t lba, uint8_t *buf, uint32_t 
     
     ssize_t rc = pread(ctx->fd, buf, total_bytes, offset);
     return (rc == (ssize_t)total_bytes) ? DRIVER_OK : DRIVER_ERR_IO;
+}
+
+static int linux_write(driver_t *self, uint32_t lba, const uint8_t *buf) {
+    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
+    if (!buf) return DRIVER_ERR_PARAM;
+    off_t offset = (off_t)lba * self->sector_size;
+    ssize_t rc = pwrite(ctx->fd, buf, self->sector_size, offset);
+    return (rc == (ssize_t)self->sector_size) ? DRIVER_OK : DRIVER_ERR_IO;
 }
 
 // --- ÚJ Multi-block write implementáció ---
@@ -105,9 +113,6 @@ driver_t linux_driver = {
     .init = linux_init,
     .read_block = linux_read,
     .write_block = linux_write,
-    // --- ÚJ mezők bekötése ---
-    .write_blocks = linux_write_mult,
-    .read_blocks = linux_read_mult, // Ha beraktad a headerbe
     .sync = linux_sync,
     .deinit = linux_deinit
 };

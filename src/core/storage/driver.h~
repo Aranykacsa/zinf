@@ -20,7 +20,11 @@ typedef struct driver {
     int  (*init)(struct driver *self);
     int  (*read_block)(struct driver *self, uint32_t lba, uint8_t *buffer);
     int  (*write_block)(struct driver *self, uint32_t lba, const uint8_t *buffer);
+    // Multi-block operations (NEW)
+    // count: az írandó blokkok (szektorok) száma
     int  (*write_blocks)(struct driver *self, uint32_t lba, const uint8_t *buffer, uint32_t count);
+    
+    // Opcionálisan érdemes lehet a read_blocks-ot is felvenni:
     int  (*read_blocks)(struct driver *self, uint32_t lba, uint8_t *buffer, uint32_t count);
     int  (*sync)(struct driver *self);
     void (*deinit)(struct driver *self);

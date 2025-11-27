@@ -65,4 +65,4 @@ def plot_thesis_final(filename):
     print("Graph saved to zinf_limit_graph.png")
 
 if __name__ == "__main__":
-    plot_thesis_final("thesis_data.csv")
+    plot_thesis_final("simple-sector.csv")

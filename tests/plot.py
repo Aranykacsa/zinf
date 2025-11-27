@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
-def plot_thesis_final(filename):
+def plot_thesis_final(filename, plotname):
     df = pd.read_csv(filename)
 
     # Create the figure with dual y-axes
@@ -61,8 +61,9 @@ def plot_thesis_final(filename):
 
     plt.title('ZINF Filesystem: The Limit of Determinism', fontsize=16, fontweight='bold', pad=20)
     fig.tight_layout()
-    plt.savefig('zinf_limit_graph.png', dpi=300)
-    print("Graph saved to zinf_limit_graph.png")
+    plot_path = './' + plotname
+    plt.savefig(plot_path, dpi=300)
+    print("Graph saved to %s", plot_path)
 
 if __name__ == "__main__":
-    plot_thesis_final("dataset.csv")
+    plot_thesis_final("multi-sector-write.csv", "multi-write.png")

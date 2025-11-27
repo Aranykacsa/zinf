@@ -114,10 +114,9 @@ int main(void) {
                 num_chunks, write_size, speed_kbps, max_lat);
     }
 
-<<<<<<< HEAD
     free(buffer);
-=======
-    status = init_log_sector();
+
+/*    status = init_log_sector();
     if (status != 0) {
         printf("Failed to init log sector.\n");
         return 1;
@@ -148,7 +147,6 @@ int main(void) {
 
     printf("Write OK\n");
 
->>>>>>> d4584e51458acefd4478c6341845f2c99d88127a
     active_driver->deinit(active_driver);
-    return 0;
+    return 0;*/
 }
