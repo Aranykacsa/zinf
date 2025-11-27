@@ -236,11 +236,11 @@ uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
         // B. Írás tükrönként - Itt használjuk az új helpert!
         for (uint8_t m = 0; m < RAID_MIRRORS; m++) {
             uint32_t physical_start_addr = base_write_cursor + (m * RAID_OFFSET);
-            
+
             // write_sectors dönt: ha van driver->write_blocks, akkor egyben küldi,
             // ha nincs, akkor ciklusban egyesével.
             int drv_rc = write_sectors(physical_start_addr, bulk_buffer, num_chunks);
-            
+
             if (drv_rc != DRIVER_OK) {
                 free(bulk_buffer);
                 return STORAGE_ERR_DRIVER;
