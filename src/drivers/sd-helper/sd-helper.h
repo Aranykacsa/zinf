@@ -1,13 +1,14 @@
-#ifndef SD_HELPER_H
-#define SD_HELPER_H
+#ifndef SD_DRIVER_H
+#define SD_DRIVER_H
 
-#include <stdint.h>
-#include "variables.h"
+#include "driver.h"
+#include "sd-helper.h"
+#include "spi.h"
+#include "variables.h" // Include variables.h to get spi_s1 definition
 
-uint8_t sd_init(spi_t* bus);
-uint8_t sd_read_block(spi_t* bus, uint32_t lba, uint8_t *dst512);
-uint8_t sd_write_block(spi_t* bus, uint32_t lba, const uint8_t *src512);
-uint8_t sd_is_sdhc(void);
-uint8_t sd_spi_set_hz(spi_t* bus, uint32_t hz);
+/**
+ * @brief Generic driver interface for the SD card.
+ */
+extern driver_t g_sd_driver;
 
-#endif /* SD_HELPER_H */
+#endif /* SD_DRIVER_H */

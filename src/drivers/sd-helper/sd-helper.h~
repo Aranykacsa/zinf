@@ -1,0 +1,2 @@
+// 📢 Use the existing spi_s1 from variables.h as the SPI bus context.
+
