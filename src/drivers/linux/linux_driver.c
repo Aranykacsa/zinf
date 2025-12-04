@@ -1,113 +1,136 @@
 #define _GNU_SOURCE
-#include <unistd.h>
 
-#include "driver.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <errno.h>
 #include <sys/ioctl.h>
+#include "string.h"
+
+#ifdef __linux__
 #include <linux/fs.h>
+#endif
+
+#include "driver.h"
+
+#define SECTOR_SIZE_DEFAULT 512
 
 typedef struct {
-    int fd;
+    int         fd;
     const char *path;
+    uint8_t    *bounce;    // 512-byte aligned bounce buffer
 } linux_ctx_t;
 
-static int linux_init(driver_t *self) {
+// ------------------- Helper -------------------
+
+static void *alloc_aligned(size_t size, size_t align) {
+    void *p = NULL;
+    if (posix_memalign(&p, align, size) != 0) return NULL;
+    return p;
+}
+
+// ------------------- Single read ------------------------
+
+static int linux_read(driver_t *self, uint32_t lba, uint8_t *buf)
+{
     linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    ctx->fd = open(ctx->path, O_RDWR | O_SYNC);
+
+    off_t off = (off_t)lba * (off_t)self->sector_size;
+    ssize_t rc = pread(ctx->fd, ctx->bounce, self->sector_size, off);
+
+    if (rc != self->sector_size) {
+        perror("[linux_driver] pread");
+        return DRIVER_ERR_IO;
+    }
+
+    memcpy(buf, ctx->bounce, self->sector_size);
+    return DRIVER_OK;
+}
+
+// ------------------- Single write ------------------------
+
+static int linux_write(driver_t *self, uint32_t lba, const uint8_t *buf)
+{
+    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
+
+    memcpy(ctx->bounce, buf, self->sector_size);
+
+    off_t off = (off_t)lba * (off_t)self->sector_size;
+    ssize_t rc = pwrite(ctx->fd, ctx->bounce, self->sector_size, off);
+
+    if (rc != self->sector_size) {
+        perror("[linux_driver] pwrite");
+        return DRIVER_ERR_IO;
+    }
+
+    return DRIVER_OK;
+}
+
+// ------------------- Init / Deinit ----------------------
+
+static int linux_init(driver_t *self)
+{
+    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
+
+    self->sector_size = SECTOR_SIZE_DEFAULT;
+
+    ctx->bounce = alloc_aligned(self->sector_size, self->sector_size);
+    if (!ctx->bounce) {
+        fprintf(stderr, "[linux_driver] cannot allocate aligned bounce buffer\n");
+        return DRIVER_ERR_INIT;
+    }
+
+    ctx->fd = open(ctx->path, O_RDWR | O_DIRECT);
     if (ctx->fd < 0) {
         perror("[linux_driver] open");
         return DRIVER_ERR_INIT;
     }
 
     uint64_t bytes = 0;
-    if (ioctl(ctx->fd, BLKGETSIZE64, &bytes) == -1) {
-        perror("[linux_driver] ioctl(BLKGETSIZE64)");
-        self->total_size_bytes = 0;
-        self->total_sectors = 0;
-    } else {
+    if (ioctl(ctx->fd, BLKGETSIZE64, &bytes) == 0) {
         self->total_size_bytes = bytes;
-        self->total_sectors = bytes / self->sector_size;
-        printf("[linux_driver] Detected size: %.2f MB (%lu sectors)\n",
-               bytes / (1024.0 * 1024.0),
-               (unsigned long)self->total_sectors);
+        self->total_sectors    = bytes / self->sector_size;
+    } else {
+        self->total_sectors = 0;
     }
 
-    printf("[linux_driver] Opened %s\n", ctx->path);
+    printf("[linux_driver] RAW open %s (fd=%d, sectors=%lu)\n",
+           ctx->path, ctx->fd, (unsigned long)self->total_sectors);
+
     return DRIVER_OK;
 }
 
-static int linux_read(driver_t *self, uint32_t lba, uint8_t *buf) {
+static void linux_deinit(driver_t *self)
+{
     linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    if (!buf) return DRIVER_ERR_PARAM;
-    off_t offset = (off_t)lba * self->sector_size;
-    ssize_t rc = pread(ctx->fd, buf, self->sector_size, offset);
-    return (rc == (ssize_t)self->sector_size) ? DRIVER_OK : DRIVER_ERR_IO;
-}
 
-static int linux_write(driver_t *self, uint32_t lba, const uint8_t *buf) {
-    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    if (!buf) return DRIVER_ERR_PARAM;
-    off_t offset = (off_t)lba * self->sector_size;
-    ssize_t rc = pwrite(ctx->fd, buf, self->sector_size, offset);
-    return (rc == (ssize_t)self->sector_size) ? DRIVER_OK : DRIVER_ERR_IO;
-}
-
-static int linux_sync(driver_t *self) {
-    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    return (fsync(ctx->fd) == 0) ? DRIVER_OK : DRIVER_ERR_IO;
-}
-
-static void linux_deinit(driver_t *self) {
-    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
     if (ctx->fd >= 0) close(ctx->fd);
-    ctx->fd = -1;
-    printf("[linux_driver] Closed device\n");
-}
-// Opcionális multi-read implementáció
-static int linux_read_mult(driver_t *self, uint32_t lba, uint8_t *buf, uint32_t count) {
-    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    if (!buf) return DRIVER_ERR_PARAM;
-    
-    size_t total_bytes = (size_t)count * self->sector_size;
-    off_t offset = (off_t)lba * self->sector_size;
-    
-    ssize_t rc = pread(ctx->fd, buf, total_bytes, offset);
-    return (rc == (ssize_t)total_bytes) ? DRIVER_OK : DRIVER_ERR_IO;
+    if (ctx->bounce) free(ctx->bounce);
+
+    printf("[linux_driver] Closed %s\n", ctx->path);
 }
 
-// --- ÚJ Multi-block write implementáció ---
-static int linux_write_mult(driver_t *self, uint32_t lba, const uint8_t *buf, uint32_t count) {
-    linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
-    if (!buf) return DRIVER_ERR_PARAM;
-    
-    // Kiszámoljuk az összes írandó bájtot
-    size_t total_bytes = (size_t)count * self->sector_size;
-    off_t offset = (off_t)lba * self->sector_size;
-    
-    // Egyetlen rendszerhívással írjuk ki az összes blokkot
-    ssize_t rc = pwrite(ctx->fd, buf, total_bytes, offset);
-    
-    // Ellenőrizzük, hogy mindent sikerült-e kiírni
-    return (rc == (ssize_t)total_bytes) ? DRIVER_OK : DRIVER_ERR_IO;
-}
+// ------------------- Global driver ----------------------
+
 static linux_ctx_t ctx = {
     .fd = -1,
-    .path = "/dev/loop0"   // change if your loopback differs
+    .path = "/dev/loop0",
+    .bounce = NULL
 };
 
 driver_t linux_driver = {
-    .name = "linux",
-    .sector_size = 512,
-    .ctx = &ctx,
-    .init = linux_init,
-    .read_block = linux_read,
-    .write_block = linux_write,
-    // --- ÚJ mezők bekötése ---
-    .write_blocks = linux_write_mult,
-    .read_blocks = linux_read_mult, // Ha beraktad a headerbe
-    .sync = linux_sync,
-    .deinit = linux_deinit
+    .name          = "linux_raw",
+    .sector_size   = SECTOR_SIZE_DEFAULT,
+    .ctx           = &ctx,
+    .init          = linux_init,
+    .read_block    = linux_read,
+    .write_block   = linux_write,
+    .read_blocks   = NULL,
+    .write_blocks  = NULL,
+    .sync          = NULL,
+    .deinit        = linux_deinit
 };
+

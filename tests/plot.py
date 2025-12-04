@@ -66,4 +66,4 @@ def plot_thesis_final(filename, plotname):
     print("Graph saved to %s", plot_path)
 
 if __name__ == "__main__":
-    plot_thesis_final("multi-sector-write.csv", "multi-write.png")
+    plot_thesis_final("direct-write.csv", "direct-write.png")

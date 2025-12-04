@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "config.h"   // contains SECTOR_SIZE, PAYLOAD_SIZE, RAID_MIRRORS
+#include "core/config.h"   // contains SECTOR_SIZE, PAYLOAD_SIZE, RAID_MIRRORS
 
 /* COMPILATION:
  *   gcc -O2 -o reader reader.c core/config.c -I./core
@@ -35,9 +35,7 @@ uint32_t crc32_u8bit(const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (int j = 0; j < 8; j++)
-            crc = (crc & 1)
-                ? ((crc >> 1) ^ 0xEDB88320)
-                : (crc >> 1);
+            crc = (crc & 1) ? ((crc >> 1) ^ 0xEDB88320) : (crc >> 1);
     }
 
     return crc ^ 0xFFFFFFFF;
@@ -148,12 +146,9 @@ int main(int argc, char *argv[]) {
         "type,last_sector,last_msg,is_first_full,raw_hex\n");
 
     /* Dump supersector metadata */
-    fprintf(csv_meta, "supersector,%u,%u,%u,\"",
-            last_sector, last_msg, is_first_full);
-
+    fprintf(csv_meta, "supersector,%u,%u,%u,\"", last_sector, last_msg, is_first_full);
     for (int i = 0; i < SECTOR_SIZE; i++)
         fprintf(csv_meta, "%02x ", sector[i]);
-
     fprintf(csv_meta, "\"\n");
 
     /* ----------------------------------------------
@@ -163,7 +158,6 @@ int main(int argc, char *argv[]) {
 
     uint32_t ok_total  = 0;
     uint32_t bad_total = 0;
-    uint32_t unrecoverable = 0;  // <-- NEW
 
     for (uint32_t logical = 2; logical <= last_sector; logical++) {
 
@@ -201,7 +195,7 @@ int main(int argc, char *argv[]) {
                             ((uint32_t)sector[510] << 16) |
                             ((uint32_t)sector[511] << 24);
 
-            calc_crc[m] = crc32_u8bit(sector, 1 + PAYLOAD_SIZE);
+            calc_crc[m] = crc32_u8bit(sector, 1 + PAYLOAD_SIZE);   // FIXED
 
             crc_ok[m] = (stored_crc[m] == calc_crc[m]);
 
@@ -212,34 +206,29 @@ int main(int argc, char *argv[]) {
                    header[m],
                    stored_crc[m],
                    calc_crc[m],
-                   crc_ok[m] ? CLR_GREEN "OK" CLR_RESET
-                             : CLR_RED   "BAD" CLR_RESET);
+                   crc_ok[m] ? CLR_GREEN "OK" CLR_RESET : CLR_RED "BAD" CLR_RESET);
         }
 
-        /* Choose a valid mirror -> recoverable or not */
+        /* Choose a valid mirror */
         int chosen = -1;
         for (int m = 0; m < RAID_MIRRORS; m++)
             if (crc_ok[m]) { chosen = m; break; }
 
-        /* Count logical sector state */
-        if (chosen >= 0) {
-            ok_total++;               // at least 1 good mirror
-        } else {
-            bad_total++;              // some corruption occurred
-            unrecoverable++;          // ALL mirrors bad → unrecoverable
-        }
+        const char *status = (chosen >= 0) ? "OK" : "ERR";
+
+        if (chosen >= 0) ok_total++;
+        else bad_total++;
 
         printf(" -> Result: %s (mirror %d)\n",
             (chosen >= 0) ? CLR_GREEN "VALID" CLR_RESET
-                          : CLR_RED   "UNRECOVERABLE" CLR_RESET,
-            (chosen >= 0) ? chosen : -1);
+                          : CLR_RED "CORRUPTED" CLR_RESET,
+            (chosen >= 0) ? chosen : 0);
 
         /* Save to CSV */
         int use = (chosen >= 0) ? chosen : 0;
 
         fprintf(csv_payload, "%s,0x%02X,\"",
-            chosen >= 0 ? "OK" : "ERR",
-            header[use]);
+            status, header[use]);
 
         for (int i = 0; i < PAYLOAD_SIZE; i++)
             fprintf(csv_payload, "%02x ", payload[use][i]);
@@ -254,10 +243,8 @@ int main(int argc, char *argv[]) {
     printf(CLR_CYAN "\n=== Summary ===\n" CLR_RESET);
     printf("Valid sectors     : %u\n", ok_total);
     printf("Corrupted sectors : %u\n", bad_total);
-    printf("Unrecoverable (all mirrors bad): %u\n", unrecoverable);
     printf("Mirrors used      : %u\n", RAID_MIRRORS);
-    printf("Output CSV        : %s, %s\n\n",
-           PATH_PAYLOAD, PATH_METADATA);
+    printf("Output CSV        : %s, %s\n\n", PATH_PAYLOAD, PATH_METADATA);
 
     fclose(csv_payload);
     fclose(csv_meta);

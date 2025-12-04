@@ -10,10 +10,11 @@
 #include <linux/fs.h>
 #include <errno.h>
 
-#include "config.h"
+#define SECTOR 512
 #include "driver.h"
 #include "storage.h"
-int SECTOR = SECTOR_SIZE;
+
+#define PAYLOAD_SIZE 507
 
 extern driver_t linux_driver;
 driver_t *active_driver = &linux_driver;
