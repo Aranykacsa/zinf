@@ -1,5 +1,0 @@
-#include "config.h"
-
-/* Alapértelmezett érték – tesztre nyugodtan legyen fix 30. */
-uint32_t RAID_OFFSET = 30;
-

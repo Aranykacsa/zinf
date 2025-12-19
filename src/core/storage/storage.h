@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "config.h"
+
+config_t* config;
 
 uint8_t setup_storage(void);
 uint8_t init_log_sector(void);

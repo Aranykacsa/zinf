@@ -1,6 +1,7 @@
 #include "storage.h"
 #include "driver.h"
-#include "config.h"   // SECTOR_SIZE, PAYLOAD_SIZE, RAID_MIRRORS, RAID_OFFSET
+#include "config.h"
+#include "helper.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -15,44 +16,11 @@
 #define STORAGE_ERR_FULL      3
 #define STORAGE_ERR_LOG_FULL  4
 
-#define CRC_SIZE    4U   // csak lokálisan használjuk, a PAYLOAD_SIZE a configból jön
-#define HEADER_SIZE 1U
-
-/* Global driver pointer (assigned externally, e.g. from main.c) */
 extern driver_t *active_driver;
 extern uint32_t log_sector;
 
-/* RAID layout – a tényleges érték a config.c-ben van, vagy main-ben állítod be */
-extern uint32_t RAID_OFFSET;
+config = get_config();
 
-/*### HELPERS ###*/
-uint32_t crc32_u8bit(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc ^ 0xFFFFFFFF;
-}
-
-/*### DRIVER HELPERS ###*/
-static int read_sector(uint32_t sector, uint8_t *buffer) {
-    return active_driver->read_block(active_driver, sector, buffer);
-}
-
-static int write_sector(uint32_t sector, const uint8_t *buffer) {
-    return active_driver->write_block(active_driver, sector, buffer);
-}
-
-/**
- * @brief Multi-sector WRITE helper
- * Automatikusan választ a natív multi-block write és a szoftveres ciklus között.
- */
 static int write_sectors(uint32_t start_sector, const uint8_t *buffer, uint32_t count) {
     if (active_driver->write_blocks != NULL) {
         return active_driver->write_blocks(active_driver, start_sector, buffer, count);
@@ -62,7 +30,7 @@ static int write_sectors(uint32_t start_sector, const uint8_t *buffer, uint32_t 
         int rc = active_driver->write_block(
             active_driver,
             start_sector + i,
-            buffer + (i * SECTOR_SIZE)
+            buffer + (i * config->sector_size)
         );
         if (rc != DRIVER_OK) return rc;
     }
@@ -73,7 +41,7 @@ static int write_sectors(uint32_t start_sector, const uint8_t *buffer, uint32_t 
 uint8_t get_last_sector(uint32_t *last_sector) {
     if (!last_sector) return STORAGE_ERR_PARAM;
 
-    uint8_t buffer[SECTOR_SIZE];
+    uint8_t buffer[config->sector_size];
     int rc = read_sector(log_sector, buffer);
     if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
 
@@ -88,7 +56,7 @@ uint8_t get_last_sector(uint32_t *last_sector) {
 uint8_t set_last_sector(const uint32_t *last_sector) {
     if (!last_sector) return STORAGE_ERR_PARAM;
 
-    uint8_t buffer[SECTOR_SIZE];
+    uint8_t buffer[config->sector_size];
     int rc = read_sector(log_sector, buffer);
     if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
 
@@ -118,7 +86,7 @@ uint8_t test_save_msg(void) {
 }
 
 uint8_t save_msg(uint8_t *msg) {
-    uint8_t buffer[SECTOR_SIZE];
+    uint8_t buffer[config->sector_size];
     uint16_t last_msg;
     uint8_t is_first_full;
 
@@ -134,7 +102,7 @@ uint8_t save_msg(uint8_t *msg) {
     last_msg++;
 
     if (is_first_full) {
-        if (last_msg == SECTOR_SIZE) {
+        if (last_msg == config->sector_size) {
             return STORAGE_ERR_LOG_FULL;
         } else {
             buffer[3] = (uint8_t)(last_msg & 0xFF);
@@ -152,7 +120,7 @@ uint8_t save_msg(uint8_t *msg) {
             if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
         }
     } else {
-        if (last_msg == SECTOR_SIZE) {
+        if (last_msg == config->sector_size) {
             last_msg = 0;
             is_first_full = 1;
 
@@ -188,7 +156,7 @@ uint8_t save_msg(uint8_t *msg) {
  */
 uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     if (!buffer || !header) return STORAGE_ERR_PARAM;
-    if (len % PAYLOAD_SIZE != 0) return STORAGE_ERR_PARAM;
+    //if (len % PAYLOAD_SIZE != 0) return STORAGE_ERR_PARAM;
 
     uint32_t last_log_index = 0;
     uint8_t rc = get_last_sector(&last_log_index);
@@ -197,30 +165,30 @@ uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     uint32_t num_chunks        = (uint32_t)(len / PAYLOAD_SIZE);
     uint32_t base_write_cursor = last_log_index + 1;
 
-    size_t total_buffer_size = (size_t)num_chunks * SECTOR_SIZE;
+    size_t total_buffer_size = (size_t)num_chunks * config->sector_size;
     uint8_t *bulk_buffer = (uint8_t*)malloc(total_buffer_size);
 
     if (bulk_buffer != NULL) {
         for (uint32_t i = 0; i < num_chunks; i++) {
-            uint8_t *sector_ptr = &bulk_buffer[i * SECTOR_SIZE];
+            uint8_t *sector_ptr = &bulk_buffer[i * config->sector_size];
 
-            memset(sector_ptr, 0, SECTOR_SIZE);
+            memset(sector_ptr, 0, config->sector_size);
             sector_ptr[0] = *header;
             memcpy(&sector_ptr[1],
                    &buffer[i * PAYLOAD_SIZE],
                    PAYLOAD_SIZE);
 
-            uint32_t crc = crc32_u8bit(sector_ptr,
+            uint32_t crc = crc32(sector_ptr,
                                        HEADER_SIZE + PAYLOAD_SIZE);
-            sector_ptr[SECTOR_SIZE - 4] = (uint8_t)(crc & 0xFF);
-            sector_ptr[SECTOR_SIZE - 3] = (uint8_t)((crc >> 8) & 0xFF);
-            sector_ptr[SECTOR_SIZE - 2] = (uint8_t)((crc >> 16) & 0xFF);
-            sector_ptr[SECTOR_SIZE - 1] = (uint8_t)((crc >> 24) & 0xFF);
+            sector_ptr[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
+            sector_ptr[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
+            sector_ptr[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
+            sector_ptr[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
         }
 
-        for (uint8_t m = 0; m < RAID_MIRRORS; m++) {
+        for (uint8_t m = 0; m < config->mirror_count; m++) {
             uint32_t physical_start_addr =
-                base_write_cursor + (uint32_t)m * RAID_OFFSET;
+                base_write_cursor + (uint32_t)m * config->mirror_offset;
 
             int drv_rc = write_sectors(physical_start_addr,
                                        bulk_buffer,
@@ -238,26 +206,26 @@ uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     }
 
     /* --- Alacsony RAM fallback: szektoronként --- */
-    uint8_t sector_buffer[SECTOR_SIZE];
+    uint8_t sector_buffer[config->sector_size];
     uint32_t current_cursor = base_write_cursor;
 
     for (uint16_t i = 0; i < num_chunks; i++) {
-        memset(sector_buffer, 0, SECTOR_SIZE);
+        memset(sector_buffer, 0, config->sector_size);
         sector_buffer[0] = *header;
         memcpy(&sector_buffer[1],
                &buffer[i * PAYLOAD_SIZE],
                PAYLOAD_SIZE);
 
-        uint32_t crc = crc32_u8bit(sector_buffer,
+        uint32_t crc = crc32(sector_buffer,
                                    HEADER_SIZE + PAYLOAD_SIZE);
-        sector_buffer[SECTOR_SIZE - 4] = (uint8_t)(crc & 0xFF);
-        sector_buffer[SECTOR_SIZE - 3] = (uint8_t)((crc >> 8) & 0xFF);
-        sector_buffer[SECTOR_SIZE - 2] = (uint8_t)((crc >> 16) & 0xFF);
-        sector_buffer[SECTOR_SIZE - 1] = (uint8_t)((crc >> 24) & 0xFF);
+        sector_buffer[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
+        sector_buffer[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
+        sector_buffer[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
+        sector_buffer[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
 
-        for (uint8_t m = 0; m < RAID_MIRRORS; m++) {
+        for (uint8_t m = 0; m < config->mirror_count; m++) {
             uint32_t physical_addr =
-                current_cursor + (uint32_t)m * RAID_OFFSET;
+                current_cursor + (uint32_t)m * config->mirror_offset;
 
             int rcw = write_sector(physical_addr, sector_buffer);
             if (rcw != DRIVER_OK) return STORAGE_ERR_DRIVER;
@@ -282,24 +250,24 @@ uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
     uint16_t num_of_sectors = (uint16_t)(len / PAYLOAD_SIZE);
     uint32_t new_sector     = last_sector;
 
-    uint8_t sector_buffer[SECTOR_SIZE];
+    uint8_t sector_buffer[config->sector_size];
 
     for (uint16_t i = 0; i < num_of_sectors; i++) {
         new_sector++;
 
-        memset(sector_buffer, 0, SECTOR_SIZE);
+        memset(sector_buffer, 0, config->sector_size);
         sector_buffer[0] = *header;
 
         memcpy(&sector_buffer[1],
                &buffer[i * PAYLOAD_SIZE],
                PAYLOAD_SIZE);
 
-        uint32_t crc = crc32_u8bit(sector_buffer,
+        uint32_t crc = crc32(sector_buffer,
                                    HEADER_SIZE + PAYLOAD_SIZE);
-        sector_buffer[SECTOR_SIZE - 4] = (uint8_t)(crc & 0xFF);
-        sector_buffer[SECTOR_SIZE - 3] = (uint8_t)((crc >> 8) & 0xFF);
-        sector_buffer[SECTOR_SIZE - 2] = (uint8_t)((crc >> 16) & 0xFF);
-        sector_buffer[SECTOR_SIZE - 1] = (uint8_t)((crc >> 24) & 0xFF);
+        sector_buffer[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
+        sector_buffer[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
+        sector_buffer[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
+        sector_buffer[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
 
         int rcw = write_sector(new_sector, sector_buffer);
         if (rcw != DRIVER_OK) return STORAGE_ERR_DRIVER;
@@ -310,13 +278,13 @@ uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
 }
 
 uint8_t init_log_sector(void) {
-    uint8_t buffer[SECTOR_SIZE];
-    memset(buffer, 0, SECTOR_SIZE);
+    uint8_t buffer[config->sector_size];
+    memset(buffer, 0, config->sector_size);
 
     int rc = write_sector(log_sector + 1, buffer);
     if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
 
-    memset(buffer, 0, SECTOR_SIZE);
+    memset(buffer, 0, config->sector_size);
 
     const uint32_t start_sector = 1;
     const uint16_t last_msg     = 0;
@@ -330,4 +298,3 @@ uint8_t init_log_sector(void) {
     rc = write_sector(log_sector, buffer);
     return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
 }
-

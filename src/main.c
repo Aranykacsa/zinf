@@ -1,167 +1,174 @@
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <time.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <linux/fs.h>
-#include <errno.h>
+#define _POSIX_C_SOURCE 199309L
 
-#include "config.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+#include <unistd.h>
+
+/* --- ZINF INCLUDES --- */
 #include "driver.h"
 #include "storage.h"
-int SECTOR = SECTOR_SIZE;
+#include "config.h"
+/* --- ZINF CONSTANTS --- */
+
 
 extern driver_t linux_driver;
 driver_t *active_driver = &linux_driver;
 
-uint32_t log_sector = 0; 
-// -------------------------------
-// Utility: aligned buffer allocator
-// -------------------------------
-static void* alloc_aligned(size_t size) {
-    void *p = NULL;
-    if (posix_memalign(&p, SECTOR, size) != 0) {
-        fprintf(stderr, "posix_memalign failed\n");
-        exit(1);
-    }
-    return p;
-}
+uint32_t log_sector = 0;
 
-// -------------------------------
-// Utility: safe pwrite with logging
-// -------------------------------
-static void do_write(int fd, void *buf, size_t size, off_t offset) {
-    ssize_t rc = pwrite(fd, buf, size, offset);
-    if (rc < 0) {
-        fprintf(stderr, "pwrite failed at offset %ld (size=%zu): %s\n",
-                (long)offset, size, strerror(errno));
-        exit(1);
-    }
-}
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <fcntl.h>
 
-// -------------------------------
-// Utility: random delay (optional)
-// -------------------------------
-static void rand_delay(int max_us) {
-    if (max_us <= 0) return;
-    int d = rand() % max_us;
-    struct timespec ts = {0, d * 1000};
-    nanosleep(&ts, NULL);
-}
-
-// -------------------------------
-// Utility: random sector hex print
-// -------------------------------
-static void debug_dump(const char *label, const void *buf, size_t sz) {
-    printf("[%s] ", label);
-    for (size_t i = 0; i < 32 && i < sz; i++)
-        printf("%02X ", ((uint8_t*)buf)[i]);
-    printf("...\n");
-}
-
-// -------------------------------
-// MAIN
-// -------------------------------
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        printf("Usage: %s /dev/loopX num_events\n", argv[0]);
-        return 1;
-    }
-
-    const char *dev = argv[1];
-    int events = atoi(argv[2]);
-
-    // ---------------------------
-    // Open loop device RAW
-    // ---------------------------
-int fd = open(dev, O_RDWR);
-
+/***************************************************************
+ * Correct RAID_OFFSET calculation for ZINF
+ ***************************************************************/
+static uint32_t compute_raid_offset(const char *devpath) {
+    int fd = open(devpath, O_RDONLY);
     if (fd < 0) {
-        perror("open");
-        return 1;
+        perror("open loopdev");
+        return 30; // fallback
     }
 
-    // Get device size
     uint64_t bytes = 0;
-    if (ioctl(fd, BLKGETSIZE64, &bytes) == -1) {
+    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0) {
         perror("BLKGETSIZE64");
         close(fd);
-        return 1;
+        return 30;
     }
-    uint64_t total_sectors = bytes / SECTOR;
-
-    printf("[INFO] Device: %s | Size: %.2f MB (%lu sectors)\n",
-           dev, bytes / (1024.0*1024.0), (unsigned long)total_sectors);
-
-    // Allocate aligned write buffer
-    uint8_t *buf = alloc_aligned(SECTOR);
-
-    srand(time(NULL));
-
-    // ---------------------------
-    // Inject N random corruption events
-    // ---------------------------
-    for (int i = 0; i < events; i++) {
-
-        int sector = rand() % total_sectors;
-        int mode   = rand() % 6;   // NEW: added powercut mode
-
-        off_t off = (off_t)sector * SECTOR;
-        printf("\n[EVENT %d] sector=%d mode=%d\n", i, sector, mode);
-
-        switch (mode) {
-
-            case 0:  // ZERO OUT SECTOR
-                memset(buf, 0x00, SECTOR);
-                debug_dump("ZERO", buf, SECTOR);
-                do_write(fd, buf, SECTOR, off);
-                break;
-
-            case 1:  // RANDOM TRASH
-                for (int j = 0; j < SECTOR; j++)
-                    buf[j] = rand() & 0xFF;
-                debug_dump("TRASH", buf, SECTOR);
-                do_write(fd, buf, SECTOR, off);
-                break;
-
-            case 2:  // HALF-SECTOR TORN WRITE (START)
-                memset(buf, 0xAA, SECTOR);
-                debug_dump("TORN-HEAD", buf, SECTOR);
-                do_write(fd, buf, SECTOR / 2, off);
-                break;
-
-            case 3:  // HALF-SECTOR TORN WRITE (TAIL)
-                memset(buf, 0xBB, SECTOR);
-                debug_dump("TORN-TAIL", buf, SECTOR);
-                do_write(fd, buf, SECTOR / 2, off + 128);
-                break;
-
-            case 4:  // MIRROR INCONSISTENCY
-                memset(buf, 0xCC, SECTOR);
-                debug_dump("MIRROR-A", buf, SECTOR);
-                do_write(fd, buf, SECTOR, off);
-
-                memset(buf, 0xDD, SECTOR);
-                debug_dump("MIRROR-B", buf, SECTOR);
-                do_write(fd, buf, SECTOR, off + SECTOR);
-                break;
-
-            case 5:  // SIMULATED POWER LOSS (no write)
-                printf("[POWER LOSS] No write performed.\n");
-                rand_delay(5000); // 0–5ms delay
-                break;
-        }
-
-        fsync(fd);
-        rand_delay(300);  // random 0–300 µs write timing jitter
-    }
-
     close(fd);
-    free(buf);
-    return 0;
+
+    uint64_t total_sectors = bytes / SECTOR_SIZE;
+
+    if (total_sectors < 32) {
+        // very small loop device → safe but small offset
+        return 4;
+    }
+
+    // usable log area starts at sector 2
+    uint64_t usable = total_sectors - 2;
+
+    uint32_t offset = (uint32_t)(usable / RAID_MIRRORS);
+
+    if (offset < 8)
+        offset = 8;  // minimum offset
+
+    return offset;
 }
 
+
+// Helper: wipe loop device (silent)
+// ---------------------------------------------------------------
+void wipe_loop_device() {
+    system("dd if=/dev/zero of=/dev/loop0 bs=1M count=5 status=none");
+}
+
+// ---------------------------------------------------------------
+// Reset entire ZINF system
+// ---------------------------------------------------------------
+void reset_zinf() {
+    if (active_driver->deinit)
+        active_driver->deinit(active_driver);
+
+    wipe_loop_device();
+    log_sector = 0;
+
+    RAID_OFFSET = compute_raid_offset("/dev/loop0");
+    if (setup_storage() != 0) {
+        fprintf(stderr, "Storage setup failed\n");
+        exit(1);
+    }
+    if (init_log_sector() != 0) {
+        fprintf(stderr, "Log init failed\n");
+        exit(1);
+    }
+}
+
+// ---------------------------------------------------------------
+uint64_t get_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// ---------------------------------------------------------------
+//                    MAIN BENCHMARK (OPTION A)
+// ---------------------------------------------------------------
+int main(void) {
+    printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten\n");
+
+    // Chunk counts = number of *sectors* written per benchmark step
+    int CHUNK_COUNTS[] = {
+        1, 2, 4, 6, 8, 10, 12, 14, 16,
+        32, 1024, 2048, 4096
+    };
+    int NUM_TESTS = sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]);
+
+    // Write ~500kB per test
+    const int TARGET_TOTAL_BYTES = 500 * 1024;
+
+    // Allocate ONE SECTOR ONLY (MCU realistic)
+    uint8_t sector_payload[SECTOR_SIZE];
+    memset(sector_payload, 0xAB, PAYLOAD_SIZE);
+
+    uint8_t header = 0x01;  // example ZINF header
+
+    for (int t = 0; t < NUM_TESTS; t++) {
+        int chunks = CHUNK_COUNTS[t];
+        int write_size = chunks * PAYLOAD_SIZE;
+
+        reset_zinf();
+
+        uint64_t max_latency = 0;
+        uint64_t total_latency = 0;
+        int ops = 0;
+        int total_bytes = 0;
+
+        uint64_t t_start = get_time_ns();
+
+        while (total_bytes < TARGET_TOTAL_BYTES) {
+
+            uint64_t t0 = get_time_ns();
+
+            // -------------------------------------------------------
+            // OPTION A: write *SECTOR BY SECTOR*, no big buffers
+            // -------------------------------------------------------
+            for (int i = 0; i < chunks; i++) {
+                uint8_t rc = raid_u8bit_values(sector_payload, PAYLOAD_SIZE, &header);
+
+                if (rc != 0) {
+                    fprintf(stderr, "ZINF write error rc=%d\n", rc);
+                    exit(1);
+                }
+            }
+
+            uint64_t t1 = get_time_ns();
+            uint64_t dt = t1 - t0;
+
+            if (dt > max_latency) max_latency = dt;
+            total_latency += dt;
+            ops++;
+
+            total_bytes += write_size;
+        }
+
+        uint64_t t_end = get_time_ns();
+        double duration = (t_end - t_start) / 1e9;
+
+        double throughput_kb = (total_bytes / 1024.0) / duration;
+        double avg_us = (total_latency / (double)ops) / 1000.0;
+        double max_us = max_latency / 1000.0;
+
+        printf("%d,%.2f,%.2f,%.2f,%d\n",
+               write_size, throughput_kb, max_us, avg_us, chunks);
+
+        fprintf(stderr,
+                "Chunks: %4d (%6d B) | Speed: %8.2f KB/s | MaxLat: %8.2f us | AvgLat: %8.2f us\n",
+                chunks, write_size, throughput_kb, max_us, avg_us);
+    }
+
+    return 0;
+}
