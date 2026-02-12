@@ -5,16 +5,14 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
-#include <unistd.h>
 
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <fcntl.h>
+#include <unistd.h>
 
-/* --- ZINF INCLUDES --- */
-#include "driver.h"
-#include "config.h"
 #include "storage.h"
+#include "config.h"
 
 static uint32_t compute_raid_offset(const char *devpath) {
     int fd = open(devpath, O_RDONLY);
@@ -37,6 +35,7 @@ static uint32_t compute_raid_offset(const char *devpath) {
 
     uint64_t usable = total_sectors - 2;
     uint32_t offset = (uint32_t)(usable / RAID_MIRRORS);
+
     if (offset < 8) offset = 8;
     return offset;
 }
@@ -46,15 +45,9 @@ static void wipe_loop_device(void) {
 }
 
 static void reset_zinf(void) {
-    if (active_driver->deinit)
-        active_driver->deinit(active_driver);
-
     wipe_loop_device();
-    log_sector = 0;
 
     RAID_OFFSET = compute_raid_offset("/dev/loop0");
-    config_init_defaults();      /* picks up RAID_OFFSET */
-    config_sync_raid_offset();   /* keep config in sync */
 
     if (setup_storage() != 0) {
         fprintf(stderr, "Storage setup failed\n");
@@ -77,7 +70,6 @@ int main(void) {
 
     int CHUNK_COUNTS[] = { 1,2,4,6,8,10,12,14,16, 32, 1024, 2048, 4096 };
     int NUM_TESTS = (int)(sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]));
-
     const int TARGET_TOTAL_BYTES = 500 * 1024;
 
     uint8_t sector_payload[SECTOR_SIZE];

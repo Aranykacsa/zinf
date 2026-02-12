@@ -1,12 +1,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "config.h"
-
-/* Minimal stub reader that just prints config + computed totals.
-   Replace with your real log parsing logic. */
 
 static uint64_t detect_total_sectors(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -21,11 +17,11 @@ static uint64_t detect_total_sectors(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    const char *img = (argc >= 2) ? argv[1] : "zinf.img";
+    const char *img = (argc >= 2) ? argv[1] : "testdisk.img";
 
     uint64_t total_sectors = detect_total_sectors(img);
     if (total_sectors == 0) {
-        printf("Could not read image '%s' (or empty). This is just a stub reader.\n", img);
+        printf("Could not read image '%s' (or empty).\n", img);
         return 1;
     }
 
@@ -34,7 +30,6 @@ int main(int argc, char **argv) {
     printf("Payload size   : %u\n", (unsigned)PAYLOAD_SIZE);
     printf("Mirrors        : %u\n", (unsigned)RAID_MIRRORS);
 
-    /* Example host-style RAID offset */
     uint64_t usable = (total_sectors > 2) ? (total_sectors - 2) : 0;
     uint32_t raid_offset = (RAID_MIRRORS > 0) ? (uint32_t)(usable / RAID_MIRRORS) : 0;
 

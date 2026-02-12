@@ -1,47 +1,70 @@
 CC = gcc
 
-CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
-         -std=c11 -O2 \
-         -I. \
-         -I./include \
-         -I./config \
-         -I./core \
-         -I./core/cli \
-         -I./core/data \
-         -I./core/log \
-         -I./core/helper \
-         -I./drivers \
-         -I./drivers/linux
+CFLAGS_COMMON = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
+                -std=c11 -O2 \
+                -I. \
+                -I./include \
+                -I./config \
+                -I./core \
+                -I./core/cli \
+                -I./core/data \
+                -I./core/log \
+                -I./core/helper \
+                -I./platform \
+                -I./apps \
+                -I./drivers \
+                -I./drivers/linux \
+                -I./drivers/embedded
 
+# ----------------------------
+# Shared core sources
+# ----------------------------
 CORE_SRC = \
-    platform_linux.c \
     config/config.c \
     core/cli/cli.c \
     core/data/data.c \
     core/log/log.c \
-    core/helper/helper.c \
-    drivers/linux/*.c
+    core/helper/helper.c
 
+# ----------------------------
+# PC / Linux flavor
+# ----------------------------
+LINUX_PLATFORM_SRC = platform/platform_linux.c
+LINUX_DRIVER_SRC   = drivers/linux/*.c
 
-ZINF_SRC   = main.c   $(CORE_SRC)
-READER_SRC = reader.c $(CORE_SRC)
+# Apps (PC)
+APP_CLI_SRC   = apps/zinf_cli_main.c
+APP_READER_SRC= apps/zinf_reader_main.c
+APP_BENCH_SRC = apps/zinf_bench_main.c
 
-ZINF_OUT   = zinf
-READER_OUT = reader
+# Outputs
+OUT_CLI   = zinf
+OUT_READER= reader
+OUT_BENCH = bench
 
-all: $(ZINF_OUT) $(READER_OUT)
+# Default: build PC tools
+all: cli reader bench
 
-$(ZINF_OUT): $(ZINF_SRC)
-	$(CC) $(CFLAGS) $(ZINF_SRC) -o $(ZINF_OUT)
+cli:
+	$(CC) $(CFLAGS_COMMON) -DZINF_PLATFORM_LINUX=1 \
+		$(APP_CLI_SRC) $(LINUX_PLATFORM_SRC) $(CORE_SRC) $(LINUX_DRIVER_SRC) \
+		-o $(OUT_CLI)
 
-$(READER_OUT): $(READER_SRC)
-	$(CC) $(CFLAGS) $(READER_SRC) -o $(READER_OUT)
+reader:
+	$(CC) $(CFLAGS_COMMON) -DZINF_PLATFORM_LINUX=1 \
+		$(APP_READER_SRC) $(LINUX_PLATFORM_SRC) $(CORE_SRC) $(LINUX_DRIVER_SRC) \
+		-o $(OUT_READER)
 
-run: $(ZINF_OUT)
-	sudo ./$(ZINF_OUT)
+bench:
+	$(CC) $(CFLAGS_COMMON) -DZINF_PLATFORM_LINUX=1 \
+		$(APP_BENCH_SRC) $(LINUX_PLATFORM_SRC) $(CORE_SRC) $(LINUX_DRIVER_SRC) \
+		-o $(OUT_BENCH)
 
-run-reader: $(READER_OUT)
-	./$(READER_OUT)
+run: cli
+	sudo ./$(OUT_CLI) cli
+
+run-bench: bench
+	sudo ./$(OUT_BENCH)
 
 clean:
-	rm -f $(ZINF_OUT) $(READER_OUT)
+	rm -f $(OUT_CLI) $(OUT_READER) $(OUT_BENCH)
