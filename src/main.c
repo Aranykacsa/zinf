@@ -7,30 +7,20 @@
 #include <stdint.h>
 #include <unistd.h>
 
-/* --- ZINF INCLUDES --- */
-#include "driver.h"
-#include "storage.h"
-#include "config.h"
-/* --- ZINF CONSTANTS --- */
-
-
-extern driver_t linux_driver;
-driver_t *active_driver = &linux_driver;
-
-uint32_t log_sector = 0;
-
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <fcntl.h>
 
-/***************************************************************
- * Correct RAID_OFFSET calculation for ZINF
- ***************************************************************/
+/* --- ZINF INCLUDES --- */
+#include "driver.h"
+#include "config.h"
+#include "storage.h"
+
 static uint32_t compute_raid_offset(const char *devpath) {
     int fd = open(devpath, O_RDONLY);
     if (fd < 0) {
         perror("open loopdev");
-        return 30; // fallback
+        return 30;
     }
 
     uint64_t bytes = 0;
@@ -43,33 +33,19 @@ static uint32_t compute_raid_offset(const char *devpath) {
 
     uint64_t total_sectors = bytes / SECTOR_SIZE;
 
-    if (total_sectors < 32) {
-        // very small loop device → safe but small offset
-        return 4;
-    }
+    if (total_sectors < 32) return 4;
 
-    // usable log area starts at sector 2
     uint64_t usable = total_sectors - 2;
-
     uint32_t offset = (uint32_t)(usable / RAID_MIRRORS);
-
-    if (offset < 8)
-        offset = 8;  // minimum offset
-
+    if (offset < 8) offset = 8;
     return offset;
 }
 
-
-// Helper: wipe loop device (silent)
-// ---------------------------------------------------------------
-void wipe_loop_device() {
+static void wipe_loop_device(void) {
     system("dd if=/dev/zero of=/dev/loop0 bs=1M count=5 status=none");
 }
 
-// ---------------------------------------------------------------
-// Reset entire ZINF system
-// ---------------------------------------------------------------
-void reset_zinf() {
+static void reset_zinf(void) {
     if (active_driver->deinit)
         active_driver->deinit(active_driver);
 
@@ -77,6 +53,9 @@ void reset_zinf() {
     log_sector = 0;
 
     RAID_OFFSET = compute_raid_offset("/dev/loop0");
+    config_init_defaults();      /* picks up RAID_OFFSET */
+    config_sync_raid_offset();   /* keep config in sync */
+
     if (setup_storage() != 0) {
         fprintf(stderr, "Storage setup failed\n");
         exit(1);
@@ -87,38 +66,28 @@ void reset_zinf() {
     }
 }
 
-// ---------------------------------------------------------------
-uint64_t get_time_ns() {
+static uint64_t get_time_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-// ---------------------------------------------------------------
-//                    MAIN BENCHMARK (OPTION A)
-// ---------------------------------------------------------------
 int main(void) {
     printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten\n");
 
-    // Chunk counts = number of *sectors* written per benchmark step
-    int CHUNK_COUNTS[] = {
-        1, 2, 4, 6, 8, 10, 12, 14, 16,
-        32, 1024, 2048, 4096
-    };
-    int NUM_TESTS = sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]);
+    int CHUNK_COUNTS[] = { 1,2,4,6,8,10,12,14,16, 32, 1024, 2048, 4096 };
+    int NUM_TESTS = (int)(sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]));
 
-    // Write ~500kB per test
     const int TARGET_TOTAL_BYTES = 500 * 1024;
 
-    // Allocate ONE SECTOR ONLY (MCU realistic)
     uint8_t sector_payload[SECTOR_SIZE];
-    memset(sector_payload, 0xAB, PAYLOAD_SIZE);
+    memset(sector_payload, 0xAB, sizeof(sector_payload));
 
-    uint8_t header = 0x01;  // example ZINF header
+    uint8_t header = 0x01;
 
     for (int t = 0; t < NUM_TESTS; t++) {
         int chunks = CHUNK_COUNTS[t];
-        int write_size = chunks * PAYLOAD_SIZE;
+        int write_size = chunks * (int)PAYLOAD_SIZE;
 
         reset_zinf();
 
@@ -130,17 +99,12 @@ int main(void) {
         uint64_t t_start = get_time_ns();
 
         while (total_bytes < TARGET_TOTAL_BYTES) {
-
             uint64_t t0 = get_time_ns();
 
-            // -------------------------------------------------------
-            // OPTION A: write *SECTOR BY SECTOR*, no big buffers
-            // -------------------------------------------------------
             for (int i = 0; i < chunks; i++) {
                 uint8_t rc = raid_u8bit_values(sector_payload, PAYLOAD_SIZE, &header);
-
                 if (rc != 0) {
-                    fprintf(stderr, "ZINF write error rc=%d\n", rc);
+                    fprintf(stderr, "ZINF write error rc=%u\n", (unsigned)rc);
                     exit(1);
                 }
             }

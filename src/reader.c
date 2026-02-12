@@ -3,265 +3,44 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "config.h"   // contains SECTOR_SIZE, PAYLOAD_SIZE, RAID_MIRRORS
+#include "config.h"
 
-/* COMPILATION:
- *   gcc -O2 -o reader reader.c core/config.c -I./core
- *
- * USAGE:
- *   sudo ./reader /dev/loop0
- */
+/* Minimal stub reader that just prints config + computed totals.
+   Replace with your real log parsing logic. */
 
-#define SUPER_SECTOR_1 0
-#define SUPER_SECTOR_2 1
-
-#define PATH_PAYLOAD  "./.out/payload.csv"
-#define PATH_METADATA "./.out/meta.csv"
-
-/* ---- Colors ---- */
-#define CLR_RESET  "\033[0m"
-#define CLR_RED    "\033[31m"
-#define CLR_GREEN  "\033[32m"
-#define CLR_YELLOW "\033[33m"
-#define CLR_CYAN   "\033[36m"
-#define CLR_MAG    "\033[35m"
-
-/* ============================================================
-   CRC32 (same polynomial as ZINF firmware)
-   ============================================================ */
-uint32_t crc32_u8bit(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc & 1)
-                ? ((crc >> 1) ^ 0xEDB88320)
-                : (crc >> 1);
-    }
-
-    return crc ^ 0xFFFFFFFF;
-}
-
-/* ============================================================
-   Read bytes
-   ============================================================ */
-int read_bytes(FILE *f, void *buf, size_t n) {
-    size_t r = fread(buf, 1, n, f);
-    return (r == n) ? 0 : -1;
-}
-
-/* ============================================================
-   Detect total sectors (safe for >4GB)
-   ============================================================ */
-uint64_t detect_total_sectors(FILE *f) {
-    fseek(f, 0, SEEK_END);
-    long long bytes = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (bytes <= 0) return 0;
-    return (uint64_t)bytes / SECTOR_SIZE;
-}
-
-/* ============================================================
-   Main
-   ============================================================ */
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <device_or_image>\n", argv[0]);
-        return 1;
-    }
-
-    const char *path = argv[1];
+static uint64_t detect_total_sectors(const char *path) {
     FILE *f = fopen(path, "rb");
+    if (!f) return 0;
 
-    if (!f) {
-        perror("fopen");
-        return 1;
-    }
-
-    /* ----------------------------------------------
-       Read total size of device
-       ---------------------------------------------- */
-    uint64_t total_sectors = detect_total_sectors(f);
-
-    if (!total_sectors) {
-        fprintf(stderr, "Failed to detect size\n");
-        fclose(f);
-        return 1;
-    }
-
-    RAID_OFFSET = total_sectors / RAID_MIRRORS;
-
-    printf(CLR_CYAN "\n=== ZINF Reader ===\n" CLR_RESET);
-    printf("Input file     : %s\n", path);
-    printf("Sector size    : %u bytes\n", SECTOR_SIZE);
-    printf("Total sectors  : %lu\n", (unsigned long)total_sectors);
-    printf("RAID mirrors   : %u\n", RAID_MIRRORS);
-    printf("RAID offset    : %u\n\n", RAID_OFFSET);
-
-    /* ----------------------------------------------
-       Read sector 0: ZINF Supersector
-       ---------------------------------------------- */
-    uint8_t sector[SECTOR_SIZE];
-
-    if (read_bytes(f, sector, SECTOR_SIZE) != 0) {
-        fprintf(stderr, "ERROR: Cannot read sector 0\n");
-        fclose(f);
-        return 1;
-    }
-
-    uint32_t last_sector = sector[0] |
-                           (sector[1] << 8) |
-                           (sector[2] << 16);
-
-    uint16_t last_msg = sector[3] |
-                        (sector[4] << 8);
-
-    uint8_t is_first_full = sector[5];
-
-    /* Clamp last_sector to physical limits */
-    if (last_sector >= total_sectors)
-        last_sector = total_sectors - RAID_OFFSET * RAID_MIRRORS - 1;
-
-    printf(CLR_MAG "=== Supersector ===\n" CLR_RESET);
-    printf("Last sector   : %u\n", last_sector);
-    printf("Last msg idx  : %u\n", last_msg);
-    printf("Ring full     : %u\n\n", is_first_full);
-
-    /* ----------------------------------------------
-       Open CSVs
-       ---------------------------------------------- */
-    FILE *csv_payload = fopen(PATH_PAYLOAD, "w");
-    FILE *csv_meta    = fopen(PATH_METADATA, "w");
-
-    if (!csv_payload || !csv_meta) {
-        perror("CSV fopen");
-        fclose(f);
-        return 1;
-    }
-
-    fprintf(csv_payload,
-        "status,header,payload_hex,crc_stored,crc_calc,mirror_used\n");
-
-    fprintf(csv_meta,
-        "type,last_sector,last_msg,is_first_full,raw_hex\n");
-
-    /* Dump supersector metadata */
-    fprintf(csv_meta, "supersector,%u,%u,%u,\"",
-            last_sector, last_msg, is_first_full);
-
-    for (int i = 0; i < SECTOR_SIZE; i++)
-        fprintf(csv_meta, "%02x ", sector[i]);
-
-    fprintf(csv_meta, "\"\n");
-
-    /* ----------------------------------------------
-       RAID Sector Scan
-       ---------------------------------------------- */
-    printf(CLR_MAG "=== Scanning Log Sectors ===\n" CLR_RESET);
-
-    uint32_t ok_total  = 0;
-    uint32_t bad_total = 0;
-    uint32_t unrecoverable = 0;  // <-- NEW
-
-    for (uint32_t logical = 2; logical <= last_sector; logical++) {
-
-        uint8_t  header[RAID_MIRRORS];
-        uint8_t  payload[RAID_MIRRORS][PAYLOAD_SIZE];
-
-        uint32_t stored_crc[RAID_MIRRORS];
-        uint32_t calc_crc[RAID_MIRRORS];
-
-        int crc_ok[RAID_MIRRORS];
-        memset(crc_ok, 0, sizeof(crc_ok));
-
-        printf(CLR_YELLOW "\nLogical sector %u\n" CLR_RESET, logical);
-        printf("--------------------------------------------------------------\n");
-
-        /* Read all mirrors */
-        for (int m = 0; m < RAID_MIRRORS; m++) {
-
-            uint64_t physical = logical + (uint64_t)m * RAID_OFFSET;
-            if (physical >= total_sectors) continue;
-
-            if (fseek(f, (long)physical * SECTOR_SIZE, SEEK_SET) != 0 ||
-                read_bytes(f, sector, SECTOR_SIZE) != 0) {
-
-                printf(CLR_RED " Mirror %d READ FAIL at sector %lu\n" CLR_RESET,
-                       m, (unsigned long)physical);
-                continue;
-            }
-
-            header[m] = sector[0];
-            memcpy(payload[m], &sector[1], PAYLOAD_SIZE);
-
-            stored_crc[m] = (uint32_t)sector[508] |
-                            ((uint32_t)sector[509] << 8) |
-                            ((uint32_t)sector[510] << 16) |
-                            ((uint32_t)sector[511] << 24);
-
-            calc_crc[m] = crc32_u8bit(sector, 1 + PAYLOAD_SIZE);
-
-            crc_ok[m] = (stored_crc[m] == calc_crc[m]);
-
-            printf(" Mirror %d @ physical %-10lu  Header: 0x%02X  "
-                   "Stored CRC: 0x%08X  Calc CRC: 0x%08X  [%s]\n",
-                   m,
-                   (unsigned long)physical,
-                   header[m],
-                   stored_crc[m],
-                   calc_crc[m],
-                   crc_ok[m] ? CLR_GREEN "OK" CLR_RESET
-                             : CLR_RED   "BAD" CLR_RESET);
-        }
-
-        /* Choose a valid mirror -> recoverable or not */
-        int chosen = -1;
-        for (int m = 0; m < RAID_MIRRORS; m++)
-            if (crc_ok[m]) { chosen = m; break; }
-
-        /* Count logical sector state */
-        if (chosen >= 0) {
-            ok_total++;               // at least 1 good mirror
-        } else {
-            bad_total++;              // some corruption occurred
-            unrecoverable++;          // ALL mirrors bad → unrecoverable
-        }
-
-        printf(" -> Result: %s (mirror %d)\n",
-            (chosen >= 0) ? CLR_GREEN "VALID" CLR_RESET
-                          : CLR_RED   "UNRECOVERABLE" CLR_RESET,
-            (chosen >= 0) ? chosen : -1);
-
-        /* Save to CSV */
-        int use = (chosen >= 0) ? chosen : 0;
-
-        fprintf(csv_payload, "%s,0x%02X,\"",
-            chosen >= 0 ? "OK" : "ERR",
-            header[use]);
-
-        for (int i = 0; i < PAYLOAD_SIZE; i++)
-            fprintf(csv_payload, "%02x ", payload[use][i]);
-
-        fprintf(csv_payload, "\",%u,%u,%d\n",
-            stored_crc[use], calc_crc[use], use);
-    }
-
-    /* ----------------------------------------------
-       Summary
-       ---------------------------------------------- */
-    printf(CLR_CYAN "\n=== Summary ===\n" CLR_RESET);
-    printf("Valid sectors     : %u\n", ok_total);
-    printf("Corrupted sectors : %u\n", bad_total);
-    printf("Unrecoverable (all mirrors bad): %u\n", unrecoverable);
-    printf("Mirrors used      : %u\n", RAID_MIRRORS);
-    printf("Output CSV        : %s, %s\n\n",
-           PATH_PAYLOAD, PATH_METADATA);
-
-    fclose(csv_payload);
-    fclose(csv_meta);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long sz = ftell(f);
     fclose(f);
+    if (sz <= 0) return 0;
+
+    return (uint64_t)sz / (uint64_t)SECTOR_SIZE;
+}
+
+int main(int argc, char **argv) {
+    const char *img = (argc >= 2) ? argv[1] : "zinf.img";
+
+    uint64_t total_sectors = detect_total_sectors(img);
+    if (total_sectors == 0) {
+        printf("Could not read image '%s' (or empty). This is just a stub reader.\n", img);
+        return 1;
+    }
+
+    printf("Image          : %s\n", img);
+    printf("Sector size    : %u\n", (unsigned)SECTOR_SIZE);
+    printf("Payload size   : %u\n", (unsigned)PAYLOAD_SIZE);
+    printf("Mirrors        : %u\n", (unsigned)RAID_MIRRORS);
+
+    /* Example host-style RAID offset */
+    uint64_t usable = (total_sectors > 2) ? (total_sectors - 2) : 0;
+    uint32_t raid_offset = (RAID_MIRRORS > 0) ? (uint32_t)(usable / RAID_MIRRORS) : 0;
+
+    printf("Total sectors  : %llu\n", (unsigned long long)total_sectors);
+    printf("Usable sectors : %llu\n", (unsigned long long)usable);
+    printf("Raid offset    : %u\n", raid_offset);
+
     return 0;
 }
-

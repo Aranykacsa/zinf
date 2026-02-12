@@ -1,26 +1,47 @@
 CC = gcc
+
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
          -std=c11 -O2 \
-         -I./drivers \
+         -I. \
+         -I./include \
          -I./config \
          -I./core \
-         -I./core/storage \
+         -I./core/cli \
+         -I./core/data \
+         -I./core/log \
          -I./core/helper \
-         -I./drivers/linux \
-         -I./include
+         -I./drivers \
+         -I./drivers/linux
+
+CORE_SRC = \
+    platform_linux.c \
+    config/config.c \
+    core/cli/cli.c \
+    core/data/data.c \
+    core/log/log.c \
+    core/helper/helper.c \
+    drivers/linux/*.c
 
 
-SRC = main.c \
-    $(wildcard core/**/*.c) \
-    $(wildcard config/*.c) \
-    $(wildcard drivers/linux/*.c)
-OUT = zinf
+ZINF_SRC   = main.c   $(CORE_SRC)
+READER_SRC = reader.c $(CORE_SRC)
 
-all:
-	$(CC) $(CFLAGS) $(SRC) -o $(OUT)
+ZINF_OUT   = zinf
+READER_OUT = reader
 
-run: all
-	sudo ./$(OUT)
+all: $(ZINF_OUT) $(READER_OUT)
+
+$(ZINF_OUT): $(ZINF_SRC)
+	$(CC) $(CFLAGS) $(ZINF_SRC) -o $(ZINF_OUT)
+
+$(READER_OUT): $(READER_SRC)
+	$(CC) $(CFLAGS) $(READER_SRC) -o $(READER_OUT)
+
+run: $(ZINF_OUT)
+	sudo ./$(ZINF_OUT)
+
+run-reader: $(READER_OUT)
+	./$(READER_OUT)
 
 clean:
-	rm -f $(OUT)
+	rm -f $(ZINF_OUT) $(READER_OUT)

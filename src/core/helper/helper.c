@@ -1,28 +1,16 @@
 #include "helper.h"
 
+/* Standard CRC32 (Ethernet/ZIP polynomial 0xEDB88320) */
 uint32_t crc32(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
+    uint32_t crc = 0xFFFFFFFFu;
+
     for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>= 1;
+        crc ^= (uint32_t)data[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = (uint32_t)-(int)(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
         }
     }
-    return crc ^ 0xFFFFFFFF;
-}
 
-
-uint8_t read_sector(uint32_t sector, uint8_t *buffer) {
-  if (!active_driver || !buffer)
-    return DRIVER_ERR_INIT;
-  return active_driver->read_block(active_driver, sector, buffer);
-}
-
-uint8_t write_sector(uint32_t sector, const uint8_t *buffer) {
-  if (!active_driver || !buffer)
-    return DRIVER_ERR_INIT;
-  return active_driver->write_block(active_driver, sector, buffer);
+    return ~crc;
 }
