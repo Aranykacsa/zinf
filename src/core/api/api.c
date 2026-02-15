@@ -10,6 +10,10 @@
 extern driver_t *active_driver;
 extern uint32_t log_sector;
 
+uint8_t get_last_sector(uint32_t *last_sector) {
+    return log_get_last_sector(last_sector);
+}
+
 /* sector I/O wrappers used by log.c and others */
 int read_sector(uint32_t sector, uint8_t *buffer) {
     if (active_driver->read_blocks) {

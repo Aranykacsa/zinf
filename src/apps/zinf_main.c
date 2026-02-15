@@ -12,19 +12,11 @@
 #include <linux/fs.h>
 #include <fcntl.h>
 
-#include "config.h"
 #include "api.h"
-#include "storage.h"
+#include "config.h" /* allowed in main.c */
 
 /* =========================================================
-   Compatibility wrapper (bench/cli may call this name)
-   ========================================================= */
-uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
-    return log_raid_u8bit_values(buffer, len, header);
-}
-
-/* =========================================================
-   CLI (inlined) — no core/cli/cli.c needed
+   CLI (inlined)
    ========================================================= */
 
 #ifndef CLI_MAX_LINE
@@ -75,20 +67,18 @@ static void cli_help(void) {
     printf("  cfg show\r\n");
     printf("  storage init\r\n");
     printf("  log init\r\n");
-    printf("  log last\r\n");
     printf("  msg save <0-255>\r\n");
     printf("  msg test\r\n");
-    printf("  raid u8 <header> <count> <v0> <v1> ...\r\n");
     printf("  raid sensor <count> <v0> <v1> ...\r\n");
 }
 
 static void cli_cfg_show(void) {
-    printf("SECTOR_SIZE      : %u\r\n", (unsigned)config->sector_size);
+    printf("SECTOR_SIZE      : %u\r\n", (unsigned)SECTOR_SIZE);
     printf("PAYLOAD_SIZE     : %u\r\n", (unsigned)PAYLOAD_SIZE);
-    printf("MIRRORS          : %u\r\n", (unsigned)config->mirror_count);
-    printf("MIRROR_OFFSET    : %u\r\n", (unsigned)config->mirror_offset);
+    printf("RAID_MIRRORS      : %u\r\n", (unsigned)RAID_MIRRORS);
     printf("SENSOR_WIRE_SIZE : %u\r\n", (unsigned)SENSOR_WIRE_SIZE);
     printf("SENSOR/MAX       : %u\r\n", (unsigned)(PAYLOAD_SIZE / SENSOR_WIRE_SIZE));
+    printf("RAID_OFFSET      : %u\r\n", (unsigned)RAID_OFFSET);
 }
 
 static void cli_cmd_storage_init(void) {
@@ -99,16 +89,6 @@ static void cli_cmd_storage_init(void) {
 static void cli_cmd_log_init(void) {
     uint8_t rc = init_log_sector();
     printf("init_log_sector: %u\r\n", (unsigned)rc);
-}
-
-static void cli_cmd_log_last(void) {
-    uint32_t last = 0;
-    uint8_t rc = log_get_last_sector(&last);
-    if (rc != STORAGE_OK) {
-        printf("log_get_last_sector error: %u\r\n", (unsigned)rc);
-        return;
-    }
-    printf("last_sector: %lu\r\n", (unsigned long)last);
 }
 
 static void cli_cmd_msg_save(const char *arg) {
@@ -127,50 +107,6 @@ static void cli_cmd_msg_test(void) {
     printf("test_save_msg: %u\r\n", (unsigned)rc);
 }
 
-/* Raw bytes raid */
-static void cli_cmd_raid_u8(int argc, char *argv[]) {
-    if (argc < 5) {
-        printf("usage: raid u8 <header> <count> <v0> <v1> ...\r\n");
-        return;
-    }
-
-    uint32_t header_u32 = 0, count_u32 = 0;
-    if (!parse_u32(argv[2], &header_u32) || header_u32 > 255 ||
-        !parse_u32(argv[3], &count_u32)) {
-        printf("invalid header/count\r\n");
-        return;
-    }
-
-    uint32_t count = count_u32;
-    if (count == 0) { printf("count must be > 0\r\n"); return; }
-
-    uint32_t provided = (uint32_t)(argc - 4);
-    if (provided < count) {
-        printf("need %lu values, got %lu\r\n",
-               (unsigned long)count, (unsigned long)provided);
-        return;
-    }
-
-    if (count > PAYLOAD_SIZE) {
-        printf("count too big for payload (max %u)\r\n", (unsigned)PAYLOAD_SIZE);
-        return;
-    }
-
-    uint8_t buf[PAYLOAD_SIZE];
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t v = 0;
-        if (!parse_u32(argv[4 + i], &v) || v > 255) {
-            printf("invalid value at index %lu\r\n", (unsigned long)i);
-            return;
-        }
-        buf[i] = (uint8_t)v;
-    }
-
-    uint8_t header = (uint8_t)header_u32;
-    uint8_t rc = raid_u8bit_values(buf, (size_t)count, &header);
-    printf("raid_u8bit_values: %u\r\n", (unsigned)rc);
-}
-
 /* Sensor raid: each v becomes one sensor sample (temp=v, humidity=v) */
 static void cli_cmd_raid_sensor(int argc, char *argv[]) {
     if (argc < 4) {
@@ -185,7 +121,10 @@ static void cli_cmd_raid_sensor(int argc, char *argv[]) {
     }
 
     uint32_t count = count_u32;
-    if (count == 0) { printf("count must be > 0\r\n"); return; }
+    if (count == 0) {
+        printf("count must be > 0\r\n");
+        return;
+    }
 
     uint32_t provided = (uint32_t)(argc - 3);
     if (provided < count) {
@@ -242,8 +181,7 @@ static void cli_process_line_local(const char *line_in) {
 
     if (strcmp(argv[0], "log") == 0) {
         if (argc >= 2 && strcmp(argv[1], "init") == 0) cli_cmd_log_init();
-        else if (argc >= 2 && strcmp(argv[1], "last") == 0) cli_cmd_log_last();
-        else printf("usage: log init | log last\r\n");
+        else printf("usage: log init\r\n");
         cli_prompt(); return;
     }
 
@@ -255,9 +193,8 @@ static void cli_process_line_local(const char *line_in) {
     }
 
     if (strcmp(argv[0], "raid") == 0) {
-        if (argc >= 2 && strcmp(argv[1], "u8") == 0) cli_cmd_raid_u8(argc, argv);
-        else if (argc >= 2 && strcmp(argv[1], "sensor") == 0) cli_cmd_raid_sensor(argc, argv);
-        else printf("usage: raid u8 ... | raid sensor ...\r\n");
+        if (argc >= 2 && strcmp(argv[1], "sensor") == 0) cli_cmd_raid_sensor(argc, argv);
+        else printf("usage: raid sensor <count> <v0> ...\r\n");
         cli_prompt(); return;
     }
 
@@ -328,7 +265,7 @@ static void join_argv(char *out, size_t out_sz, int argc, char **argv, int start
 }
 
 /* -----------------------------
-   Reader
+   Reader (geometry/info only)
 ----------------------------- */
 
 static uint64_t detect_total_sectors(const char *path) {
@@ -366,7 +303,7 @@ static int run_reader(const char *img) {
 }
 
 /* -----------------------------
-   Benchmark helpers
+   Benchmark
 ----------------------------- */
 
 static uint32_t compute_raid_offset(const char *devpath) {
@@ -543,6 +480,7 @@ static int run_benchmark(void) {
 ----------------------------- */
 
 static void cli_init_storage(void) {
+    /* mimic bench: compute RAID_OFFSET based on /dev/loop0 size */
     RAID_OFFSET = compute_raid_offset("/dev/loop0");
 
     if (setup_storage() != STORAGE_OK) {
@@ -606,5 +544,6 @@ int main(int argc, char **argv) {
         return run_reader(argv[2]);
     }
 
+    /* Otherwise treat argv[1..] as a one-shot CLI command */
     return run_cli_one_shot(argc, argv, 1);
 }
