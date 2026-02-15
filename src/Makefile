@@ -3,11 +3,10 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
          -std=c11 -O2 \
          -I. \
-         -I./include \
          -I./config \
          -I./core \
-         -I./core/data \
-         -I./core/log \
+         -I./core/api \
+         -I./core/storage \
          -I./core/helper \
          -I./platform \
          -I./drivers \
@@ -17,8 +16,8 @@ SRC = \
     apps/zinf_main.c \
     platform/platform_linux.c \
     config/config.c \
-    core/data/data.c \
-    core/log/log.c \
+    core/api/api.c \
+    core/storage/storage.c \
     core/helper/helper.c \
     drivers/linux/*.c
 

@@ -13,9 +13,8 @@
 #include <fcntl.h>
 
 #include "config.h"
+#include "api.h"
 #include "storage.h"
-#include "data.h"
-#include "log.h"
 
 /* =========================================================
    Compatibility wrapper (bench/cli may call this name)

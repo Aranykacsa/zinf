@@ -1,6 +1,5 @@
-#include "log.h"
-
 #include "storage.h"
+
 #include "driver.h"
 #include "config.h"
 #include "helper.h"
