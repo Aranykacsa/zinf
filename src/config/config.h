@@ -44,3 +44,8 @@ void config_init_defaults(void);
 static inline void config_sync_raid_offset(void) {
     if (config) config->mirror_offset = RAID_OFFSET;
 }
+
+typedef struct sensor_t {
+    float temp;
+    float humidity;
+} sensor_t;

@@ -6,7 +6,6 @@ CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
          -I./include \
          -I./config \
          -I./core \
-         -I./core/cli \
          -I./core/data \
          -I./core/log \
          -I./core/helper \
@@ -18,7 +17,6 @@ SRC = \
     apps/zinf_main.c \
     platform/platform_linux.c \
     config/config.c \
-    core/cli/cli.c \
     core/data/data.c \
     core/log/log.c \
     core/helper/helper.c \

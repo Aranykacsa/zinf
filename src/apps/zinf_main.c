@@ -14,11 +14,286 @@
 
 #include "config.h"
 #include "storage.h"
-#include "cli.h"
+#include "data.h"
+#include "log.h"
 
-/* -----------------------------
-   Utilities
------------------------------ */
+/* =========================================================
+   Compatibility wrapper (bench/cli may call this name)
+   ========================================================= */
+uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
+    return log_raid_u8bit_values(buffer, len, header);
+}
+
+/* =========================================================
+   CLI (inlined) — no core/cli/cli.c needed
+   ========================================================= */
+
+#ifndef CLI_MAX_LINE
+#define CLI_MAX_LINE 256
+#endif
+
+#ifndef CLI_MAX_TOKENS
+#define CLI_MAX_TOKENS 32
+#endif
+
+#ifndef SENSOR_WIRE_SIZE
+#define SENSOR_WIRE_SIZE 8u
+#endif
+
+static char   g_line[CLI_MAX_LINE];
+static size_t g_len = 0;
+
+static void cli_prompt(void) { printf("> "); }
+
+static int parse_u32(const char *s, uint32_t *out) {
+    if (!s || !*s || !out) return 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 0);
+    if (end == s || *end != '\0') return 0;
+    *out = (uint32_t)v;
+    return 1;
+}
+
+static int tokenize(char *line, char *argv[], int max_argv) {
+    int argc = 0;
+    char *p = line;
+
+    while (*p && argc < max_argv) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        argv[argc++] = p;
+
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = '\0';
+    }
+    return argc;
+}
+
+static void cli_help(void) {
+    printf("Commands:\r\n");
+    printf("  help\r\n");
+    printf("  cfg show\r\n");
+    printf("  storage init\r\n");
+    printf("  log init\r\n");
+    printf("  log last\r\n");
+    printf("  msg save <0-255>\r\n");
+    printf("  msg test\r\n");
+    printf("  raid u8 <header> <count> <v0> <v1> ...\r\n");
+    printf("  raid sensor <count> <v0> <v1> ...\r\n");
+}
+
+static void cli_cfg_show(void) {
+    printf("SECTOR_SIZE      : %u\r\n", (unsigned)config->sector_size);
+    printf("PAYLOAD_SIZE     : %u\r\n", (unsigned)PAYLOAD_SIZE);
+    printf("MIRRORS          : %u\r\n", (unsigned)config->mirror_count);
+    printf("MIRROR_OFFSET    : %u\r\n", (unsigned)config->mirror_offset);
+    printf("SENSOR_WIRE_SIZE : %u\r\n", (unsigned)SENSOR_WIRE_SIZE);
+    printf("SENSOR/MAX       : %u\r\n", (unsigned)(PAYLOAD_SIZE / SENSOR_WIRE_SIZE));
+}
+
+static void cli_cmd_storage_init(void) {
+    uint8_t rc = setup_storage();
+    printf("setup_storage: %u\r\n", (unsigned)rc);
+}
+
+static void cli_cmd_log_init(void) {
+    uint8_t rc = init_log_sector();
+    printf("init_log_sector: %u\r\n", (unsigned)rc);
+}
+
+static void cli_cmd_log_last(void) {
+    uint32_t last = 0;
+    uint8_t rc = log_get_last_sector(&last);
+    if (rc != STORAGE_OK) {
+        printf("log_get_last_sector error: %u\r\n", (unsigned)rc);
+        return;
+    }
+    printf("last_sector: %lu\r\n", (unsigned long)last);
+}
+
+static void cli_cmd_msg_save(const char *arg) {
+    uint32_t v = 0;
+    if (!parse_u32(arg, &v) || v > 255) {
+        printf("usage: msg save <0-255>\r\n");
+        return;
+    }
+    uint8_t b = (uint8_t)v;
+    uint8_t rc = save_msg(&b);
+    printf("save_msg: %u\r\n", (unsigned)rc);
+}
+
+static void cli_cmd_msg_test(void) {
+    uint8_t rc = test_save_msg();
+    printf("test_save_msg: %u\r\n", (unsigned)rc);
+}
+
+/* Raw bytes raid */
+static void cli_cmd_raid_u8(int argc, char *argv[]) {
+    if (argc < 5) {
+        printf("usage: raid u8 <header> <count> <v0> <v1> ...\r\n");
+        return;
+    }
+
+    uint32_t header_u32 = 0, count_u32 = 0;
+    if (!parse_u32(argv[2], &header_u32) || header_u32 > 255 ||
+        !parse_u32(argv[3], &count_u32)) {
+        printf("invalid header/count\r\n");
+        return;
+    }
+
+    uint32_t count = count_u32;
+    if (count == 0) { printf("count must be > 0\r\n"); return; }
+
+    uint32_t provided = (uint32_t)(argc - 4);
+    if (provided < count) {
+        printf("need %lu values, got %lu\r\n",
+               (unsigned long)count, (unsigned long)provided);
+        return;
+    }
+
+    if (count > PAYLOAD_SIZE) {
+        printf("count too big for payload (max %u)\r\n", (unsigned)PAYLOAD_SIZE);
+        return;
+    }
+
+    uint8_t buf[PAYLOAD_SIZE];
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v = 0;
+        if (!parse_u32(argv[4 + i], &v) || v > 255) {
+            printf("invalid value at index %lu\r\n", (unsigned long)i);
+            return;
+        }
+        buf[i] = (uint8_t)v;
+    }
+
+    uint8_t header = (uint8_t)header_u32;
+    uint8_t rc = raid_u8bit_values(buf, (size_t)count, &header);
+    printf("raid_u8bit_values: %u\r\n", (unsigned)rc);
+}
+
+/* Sensor raid: each v becomes one sensor sample (temp=v, humidity=v) */
+static void cli_cmd_raid_sensor(int argc, char *argv[]) {
+    if (argc < 4) {
+        printf("usage: raid sensor <count> <v0> <v1> ...\r\n");
+        return;
+    }
+
+    uint32_t count_u32 = 0;
+    if (!parse_u32(argv[2], &count_u32)) {
+        printf("invalid count\r\n");
+        return;
+    }
+
+    uint32_t count = count_u32;
+    if (count == 0) { printf("count must be > 0\r\n"); return; }
+
+    uint32_t provided = (uint32_t)(argc - 3);
+    if (provided < count) {
+        printf("need %lu values, got %lu\r\n",
+               (unsigned long)count, (unsigned long)provided);
+        return;
+    }
+
+    const uint32_t max_records = (uint32_t)(PAYLOAD_SIZE / SENSOR_WIRE_SIZE);
+    if (count > max_records) {
+        printf("count too big (max %lu sensor records per payload)\r\n",
+               (unsigned long)max_records);
+        return;
+    }
+
+    sensor_t buf[count];
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v = 0;
+        if (!parse_u32(argv[3 + i], &v) || v > 255) {
+            printf("invalid value at index %lu\r\n", (unsigned long)i);
+            return;
+        }
+        buf[i].temp = (float)v;
+        buf[i].humidity = (float)v;
+    }
+
+    uint8_t rc = raid_sensor_values(buf, (size_t)count);
+    printf("raid_sensor_values: %u\r\n", (unsigned)rc);
+}
+
+static void cli_process_line_local(const char *line_in) {
+    if (!line_in) return;
+
+    char line[CLI_MAX_LINE];
+    strncpy(line, line_in, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+
+    char *argv[CLI_MAX_TOKENS];
+    int argc = tokenize(line, argv, CLI_MAX_TOKENS);
+
+    if (argc == 0) { cli_prompt(); return; }
+
+    if (strcmp(argv[0], "help") == 0) { cli_help(); cli_prompt(); return; }
+
+    if (strcmp(argv[0], "cfg") == 0 && argc >= 2 && strcmp(argv[1], "show") == 0) {
+        cli_cfg_show(); cli_prompt(); return;
+    }
+
+    if (strcmp(argv[0], "storage") == 0) {
+        if (argc >= 2 && strcmp(argv[1], "init") == 0) cli_cmd_storage_init();
+        else printf("usage: storage init\r\n");
+        cli_prompt(); return;
+    }
+
+    if (strcmp(argv[0], "log") == 0) {
+        if (argc >= 2 && strcmp(argv[1], "init") == 0) cli_cmd_log_init();
+        else if (argc >= 2 && strcmp(argv[1], "last") == 0) cli_cmd_log_last();
+        else printf("usage: log init | log last\r\n");
+        cli_prompt(); return;
+    }
+
+    if (strcmp(argv[0], "msg") == 0) {
+        if (argc >= 2 && strcmp(argv[1], "test") == 0) cli_cmd_msg_test();
+        else if (argc >= 3 && strcmp(argv[1], "save") == 0) cli_cmd_msg_save(argv[2]);
+        else printf("usage: msg save <0-255> | msg test\r\n");
+        cli_prompt(); return;
+    }
+
+    if (strcmp(argv[0], "raid") == 0) {
+        if (argc >= 2 && strcmp(argv[1], "u8") == 0) cli_cmd_raid_u8(argc, argv);
+        else if (argc >= 2 && strcmp(argv[1], "sensor") == 0) cli_cmd_raid_sensor(argc, argv);
+        else printf("usage: raid u8 ... | raid sensor ...\r\n");
+        cli_prompt(); return;
+    }
+
+    printf("unknown command: %s\r\n", argv[0]);
+    cli_prompt();
+}
+
+static void cli_rx_char_local(char c) {
+    if (c == '\r') return;
+
+    if (c == '\n') {
+        g_line[g_len] = '\0';
+        printf("\r\n");
+        cli_process_line_local(g_line);
+        g_len = 0;
+        return;
+    }
+
+    if (c == '\b' || c == 127) {
+        if (g_len > 0) {
+            g_len--;
+            printf("\b \b");
+        }
+        return;
+    }
+
+    if (g_len < (CLI_MAX_LINE - 1)) {
+        g_line[g_len++] = c;
+        putchar(c);
+    }
+}
+
+/* =========================================================
+   Utilities for main modes
+   ========================================================= */
 
 static void print_usage(const char *argv0) {
     printf("Usage:\n");
@@ -35,7 +310,6 @@ static void print_usage(const char *argv0) {
     printf("  %s read testdisk.img\n", argv0);
 }
 
-/* join argv[start..] into one space-separated string */
 static void join_argv(char *out, size_t out_sz, int argc, char **argv, int start) {
     size_t pos = 0;
     out[0] = '\0';
@@ -55,7 +329,7 @@ static void join_argv(char *out, size_t out_sz, int argc, char **argv, int start
 }
 
 /* -----------------------------
-   Reader (currently geometry/info)
+   Reader
 ----------------------------- */
 
 static uint64_t detect_total_sectors(const char *path) {
@@ -93,7 +367,7 @@ static int run_reader(const char *img) {
 }
 
 /* -----------------------------
-   Benchmark (your current logic)
+   Benchmark helpers
 ----------------------------- */
 
 static uint32_t compute_raid_offset(const char *devpath) {
@@ -147,6 +421,52 @@ static uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Synthetic sensor generator for benchmark */
+static inline uint32_t xs32(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static inline float noise_f(uint32_t *state, float amp) {
+    uint32_t r = xs32(state) & 0xFFFFu;
+    float n = ((float)r / 32767.5f) - 1.0f;
+    return n * amp;
+}
+
+static inline float tri01(uint32_t phase, uint32_t period) {
+    if (period == 0) return 0.0f;
+    uint32_t p = phase % period;
+    uint32_t half = period / 2u;
+    if (half == 0) return 0.0f;
+    if (p < half) return (float)p / (float)half;
+    return (float)(period - p) / (float)half;
+}
+
+static void sensor_generate(sensor_t *s, uint32_t tick) {
+    const uint32_t TEMP_PERIOD = 2000u;
+    const uint32_t HUM_PERIOD  = 2600u;
+
+    float t_wave = tri01(tick, TEMP_PERIOD);
+    float h_wave = tri01(tick, HUM_PERIOD);
+
+    float temp = 18.0f + 12.0f * t_wave;
+    float hum  = 65.0f - 30.0f * h_wave;
+
+    uint32_t rng = 0xA5A5u ^ (tick * 2654435761u);
+    temp += noise_f(&rng, 0.15f);
+    hum  += noise_f(&rng, 0.40f);
+
+    if (hum < 0.0f) hum = 0.0f;
+    if (hum > 100.0f) hum = 100.0f;
+
+    s->temp = temp;
+    s->humidity = hum;
+}
+
 static int run_benchmark(void) {
     printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten\n");
 
@@ -154,10 +474,14 @@ static int run_benchmark(void) {
     int NUM_TESTS = (int)(sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]));
     const int TARGET_TOTAL_BYTES = 500 * 1024;
 
-    uint8_t sector_payload[SECTOR_SIZE];
-    memset(sector_payload, 0xAB, sizeof(sector_payload));
+    const int max_records = (int)(PAYLOAD_SIZE / SENSOR_WIRE_SIZE);
+    if (max_records <= 0) {
+        fprintf(stderr, "PAYLOAD_SIZE too small for SENSOR_WIRE_SIZE\n");
+        return 1;
+    }
 
-    uint8_t header = 0x01;
+    sensor_t sensors[max_records];
+    uint32_t tick = 0;
 
     for (int t = 0; t < NUM_TESTS; t++) {
         int chunks = CHUNK_COUNTS[t];
@@ -176,7 +500,11 @@ static int run_benchmark(void) {
             uint64_t t0 = get_time_ns();
 
             for (int i = 0; i < chunks; i++) {
-                uint8_t rc = raid_u8bit_values(sector_payload, PAYLOAD_SIZE, &header);
+                for (int k = 0; k < max_records; k++) {
+                    sensor_generate(&sensors[k], tick++);
+                }
+
+                uint8_t rc = raid_sensor_values(sensors, (size_t)max_records);
                 if (rc != 0) {
                     fprintf(stderr, "ZINF write error rc=%u\n", (unsigned)rc);
                     return 1;
@@ -216,7 +544,6 @@ static int run_benchmark(void) {
 ----------------------------- */
 
 static void cli_init_storage(void) {
-    /* mimic bench: compute RAID_OFFSET based on /dev/loop0 size */
     RAID_OFFSET = compute_raid_offset("/dev/loop0");
 
     if (setup_storage() != STORAGE_OK) {
@@ -228,12 +555,13 @@ static void cli_init_storage(void) {
 static int run_cli_interactive(void) {
     cli_init_storage();
 
-    printf("ZINF CLI. Type 'help'.\n> ");
+    printf("ZINF CLI. Type 'help'.\n");
+    cli_prompt();
     fflush(stdout);
 
     int c;
     while ((c = getchar()) != EOF) {
-        cli_rx_char((char)c);
+        cli_rx_char_local((char)c);
         fflush(stdout);
     }
     return 0;
@@ -244,7 +572,7 @@ static int run_cli_one_shot(int argc, char **argv, int start_index) {
 
     char line[512];
     join_argv(line, sizeof(line), argc, argv, start_index);
-    cli_process_line(line);
+    cli_process_line_local(line);
     return 0;
 }
 
@@ -279,6 +607,5 @@ int main(int argc, char **argv) {
         return run_reader(argv[2]);
     }
 
-    /* Otherwise treat argv[1..] as a one-shot CLI command */
     return run_cli_one_shot(argc, argv, 1);
 }
