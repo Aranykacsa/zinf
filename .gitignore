@@ -10,3 +10,5 @@ obj/
 .DS_Store
 *.swp
 
+src/testdisk.img
+src/testdisk.img

@@ -13,7 +13,7 @@
 #include "config.h"
 #include "driver.h"
 #include "storage.h"
-
+int SECTOR = SECTOR_SIZE;
 
 extern driver_t linux_driver;
 driver_t *active_driver = &linux_driver;

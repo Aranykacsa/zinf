@@ -103,7 +103,7 @@ int main(void) {
     // Chunk counts = number of *sectors* written per benchmark step
     int CHUNK_COUNTS[] = {
         1, 2, 4, 6, 8, 10, 12, 14, 16,
-        32, 1024, 2048, 4096, 8192, 16384, 32768
+        32, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152
     };
     int NUM_TESTS = sizeof(CHUNK_COUNTS) / sizeof(CHUNK_COUNTS[0]);
 
