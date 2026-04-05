@@ -1,178 +1,209 @@
 #include "api.h"
-
 #include "driver.h"
 #include "storage.h"
+#include "helper.h"
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-extern driver_t *active_driver;
-extern uint32_t log_sector;
+/* -----------------------------------------------------------------------
+   Raw sector I/O
+   ----------------------------------------------------------------------- */
 
-uint8_t get_last_sector(uint32_t *last_sector) {
-    return log_get_last_sector(last_sector);
+int read_sector(zinf_ctx_t *ctx, uint64_t sector, uint8_t *buffer) {
+    if (ctx->driver->read_blocks)
+        return ctx->driver->read_blocks(ctx->driver, sector, buffer, 1);
+    return ctx->driver->read_block(ctx->driver, sector, buffer);
 }
 
-/* sector I/O wrappers used by log.c and others */
-int read_sector(uint32_t sector, uint8_t *buffer) {
-    if (active_driver->read_blocks) {
-        return active_driver->read_blocks(active_driver, sector, buffer, 1);
-    }
-    return active_driver->read_block(active_driver, sector, buffer);
+int write_sector(zinf_ctx_t *ctx, uint64_t sector, const uint8_t *buffer) {
+    if (ctx->driver->write_blocks)
+        return ctx->driver->write_blocks(ctx->driver, sector, buffer, 1);
+    return ctx->driver->write_block(ctx->driver, sector, buffer);
 }
 
-int write_sector(uint32_t sector, const uint8_t *buffer) {
-    if (active_driver->write_blocks) {
-        return active_driver->write_blocks(active_driver, sector, buffer, 1);
-    }
-    return active_driver->write_block(active_driver, sector, buffer);
-}
+/* -----------------------------------------------------------------------
+   Lifecycle
+   ----------------------------------------------------------------------- */
 
-uint8_t setup_storage(void) {
-    /* ensure config exists */
-    config_init_defaults();
-
-    int rc = active_driver->init(active_driver);
+uint8_t setup_storage(zinf_ctx_t *ctx) {
+    zinf_ctx_init_defaults(ctx);
+    int rc = ctx->driver->init(ctx->driver);
     printf("[STORAGE] init: %d\r\n", rc);
     return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
 }
 
-/* === message logger that uses log_sector and log_sector+1 as before === */
-uint8_t test_save_msg(void) {
-    uint8_t err;
-    uint8_t msg = 5;
-    for (uint32_t i = 0; i < 1024; i++) {
-        err = save_msg(&msg);
-        if (err != STORAGE_OK) return err;
-    }
-    return STORAGE_OK;
+uint8_t init_log_sector(zinf_ctx_t *ctx) {
+    return log_init_log_sector(ctx);
 }
 
-#define LOG_HDR_SIZE    6u
-#define LOG_DATA0_CAP   (SECTOR_SIZE - LOG_HDR_SIZE)
-#define LOG_TOTAL_CAP   (LOG_DATA0_CAP + SECTOR_SIZE)  // payload bytes across 2 sectors
+uint8_t get_last_sector(zinf_ctx_t *ctx, uint64_t *last_sector) {
+    return log_get_last_sector(ctx, last_sector);
+}
+
+/* -----------------------------------------------------------------------
+   RAID read with CRC verification + mirror fallback + majority voting
+   ----------------------------------------------------------------------- */
+
+uint8_t raid_read(zinf_ctx_t *ctx, uint64_t logical_sector, uint8_t *payload) {
+    if (!payload) return STORAGE_ERR_PARAM;
+
+    uint8_t  raw[SECTOR_SIZE];
+    uint8_t  candidates[PAYLOAD_SIZE * MAX_MIRRORS];
+    uint8_t  valid_count  = 0;
+    /* mirror_count is clamped to MAX_MIRRORS by zinf_ctx_init_defaults */
+    uint8_t  limit = (ctx->mirror_count < MAX_MIRRORS)
+                     ? ctx->mirror_count : (uint8_t)MAX_MIRRORS;
+
+    for (uint8_t m = 0; m < limit; m++) {
+        uint64_t phys = logical_sector + (uint64_t)m * ctx->mirror_offset;
+
+        if (read_sector(ctx, phys, raw) != DRIVER_OK) continue;
+
+        uint32_t stored = (uint32_t)raw[ctx->sector_size - 4]
+                        | ((uint32_t)raw[ctx->sector_size - 3] << 8)
+                        | ((uint32_t)raw[ctx->sector_size - 2] << 16)
+                        | ((uint32_t)raw[ctx->sector_size - 1] << 24);
+        uint32_t calc = crc32(raw, HEADER_SIZE + PAYLOAD_SIZE);
+
+        if (calc == stored) {
+            memcpy(&candidates[valid_count * PAYLOAD_SIZE],
+                   &raw[HEADER_SIZE], PAYLOAD_SIZE);
+            valid_count++;
+        }
+    }
+
+    if (valid_count == 0) return STORAGE_ERR_UNRECOVERABLE;
+
+    /* For a single valid mirror just return it */
+    if (valid_count == 1 || ctx->mirror_count < 3) {
+        memcpy(payload, &candidates[0], PAYLOAD_SIZE);
+        return STORAGE_OK;
+    }
+
+    /* Majority vote: find the candidate agreed upon by > mirror_count/2 mirrors */
+    uint8_t majority_threshold = (uint8_t)(ctx->mirror_count / 2u + 1u);
+    for (uint8_t i = 0; i < valid_count; i++) {
+        uint8_t votes = 1;
+        for (uint8_t j = 0; j < valid_count; j++) {
+            if (j != i && memcmp(&candidates[i * PAYLOAD_SIZE],
+                                 &candidates[j * PAYLOAD_SIZE],
+                                 PAYLOAD_SIZE) == 0) {
+                votes++;
+            }
+        }
+        if (votes >= majority_threshold) {
+            memcpy(payload, &candidates[i * PAYLOAD_SIZE], PAYLOAD_SIZE);
+            return STORAGE_OK;
+        }
+    }
+
+    /* No majority found — all valid mirrors disagree; data is unrecoverable */
+    return STORAGE_ERR_UNRECOVERABLE;
+}
+
+/* -----------------------------------------------------------------------
+   Message log
+   Uses ctx->log_sector (sector 0) and ctx->log_sector+1 for the log.
+   write_pos is stored at META_WRITE_POS_OFF inside the metadata sector.
+   ----------------------------------------------------------------------- */
 
 static inline uint16_t rd_u16_le(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 static inline void wr_u16_le(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)(v & 0xFF);
+    p[0] = (uint8_t)(v & 0xFFu);
     p[1] = (uint8_t)(v >> 8);
 }
 
-uint8_t save_msg(uint8_t *msg) {
-    uint8_t buffer[SECTOR_SIZE];
-    uint16_t pos;               // NEXT write position in payload stream
+uint8_t save_msg(zinf_ctx_t *ctx, uint8_t *msg) {
+    uint8_t  buffer[SECTOR_SIZE];
+    uint16_t pos;
     uint32_t target_sector;
     uint16_t offset_in_sector;
 
-    int rc = read_sector(log_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    if (read_sector(ctx, ctx->log_sector, buffer) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
-    pos = rd_u16_le(&buffer[3]);
+    pos = rd_u16_le(&buffer[META_WRITE_POS_OFF]);
 
-    if (pos >= (uint16_t)LOG_TOTAL_CAP) {
+    if (pos >= (uint16_t)MSG_LOG_TOTAL_CAP)
         return STORAGE_ERR_LOG_FULL;
-    }
 
-    // Map payload pos to physical location (skip header in first sector)
-    if (pos < LOG_DATA0_CAP) {
-        target_sector = log_sector;
-        offset_in_sector = (uint16_t)(LOG_HDR_SIZE + pos);
+    /* Map logical payload position to physical (sector, offset) */
+    if (pos < (uint16_t)MSG_LOG_CAP_S0) {
+        target_sector    = ctx->log_sector;
+        offset_in_sector = (uint16_t)(META_HDR_SIZE + pos);
     } else {
-        target_sector = log_sector + 1;
-        offset_in_sector = (uint16_t)(pos - LOG_DATA0_CAP);
+        target_sector    = ctx->log_sector + 1u;
+        offset_in_sector = (uint16_t)(pos - MSG_LOG_CAP_S0);
     }
 
-    rc = read_sector(target_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    if (read_sector(ctx, target_sector, buffer) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
     buffer[offset_in_sector] = *msg;
 
-    rc = write_sector(target_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    if (write_sector(ctx, target_sector, buffer) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
-    // Persist incremented pos
+    /* Persist incremented write cursor back to metadata sector */
     pos++;
+    if (read_sector(ctx, ctx->log_sector, buffer) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
-    rc = read_sector(log_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    wr_u16_le(&buffer[META_WRITE_POS_OFF], pos);
 
-    wr_u16_le(&buffer[3], pos);
-
-    rc = write_sector(log_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    if (write_sector(ctx, ctx->log_sector, buffer) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
     return STORAGE_OK;
 }
 
-
-/* === compatibility wrappers (so main.c stays unchanged) === */
-uint8_t init_log_sector(void) {
-    return log_init_log_sector();
-}
-
-#ifndef SENSOR_WIRE_SIZE
-#define SENSOR_WIRE_SIZE 8u  // 2x float32
-#endif
-
-// If you don't want to add a new error code, just reuse an existing one.
-// Pick something that already exists in storage.h; here I'll use STORAGE_ERR_DRIVER as "bad arg".
-#ifndef STORAGE_ERR_INVALID_ARG
-#define STORAGE_ERR_INVALID_ARG STORAGE_ERR_DRIVER
-#endif
-
-static inline void pack_u32_le(uint8_t out[4], uint32_t v) {
-    out[0] = (uint8_t)(v & 0xFF);
-    out[1] = (uint8_t)((v >> 8) & 0xFF);
-    out[2] = (uint8_t)((v >> 16) & 0xFF);
-    out[3] = (uint8_t)((v >> 24) & 0xFF);
-}
-
-static inline void pack_f32_le(uint8_t out[4], float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof(u));
-    pack_u32_le(out, u);
-}
-
-// write N bytes by repeatedly calling save_msg()
-static uint8_t save_bytes(const void *data, size_t len) {
-    const uint8_t *p = (const uint8_t*)data;
-    for (size_t i = 0; i < len; i++) {
-        uint8_t b = p[i];
-        uint8_t err = save_msg(&b);
+uint8_t test_save_msg(zinf_ctx_t *ctx) {
+    uint8_t msg = 5u;
+    for (uint32_t i = 0; i < 1024u; i++) {
+        uint8_t err = save_msg(ctx, &msg);
         if (err != STORAGE_OK) return err;
     }
     return STORAGE_OK;
 }
 
-static inline size_t sensor_to_u8(uint8_t *out, size_t cap, const sensor_t *s) {
-    if (cap < SENSOR_WIRE_SIZE) return 0;
+/* -----------------------------------------------------------------------
+   Typed RAID writes
+   ----------------------------------------------------------------------- */
+
+#define SENSOR_WIRE_SIZE 8u  /* 2 × float32 */
+
+static inline void pack_f32_le(uint8_t out[4], float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    out[0] = (uint8_t)(u & 0xFFu);
+    out[1] = (uint8_t)((u >> 8)  & 0xFFu);
+    out[2] = (uint8_t)((u >> 16) & 0xFFu);
+    out[3] = (uint8_t)((u >> 24) & 0xFFu);
+}
+
+static inline size_t sensor_to_wire(uint8_t *out, const sensor_t *s) {
     pack_f32_le(&out[0], s->temp);
     pack_f32_le(&out[4], s->humidity);
     return SENSOR_WIRE_SIZE;
 }
 
-uint8_t save_sensor(const sensor_t *s) {
-    uint8_t payload[SENSOR_WIRE_SIZE];
-    size_t n = sensor_to_u8(payload, sizeof(payload), s);
-    if (n == 0) return STORAGE_ERR_INVALID_ARG;
-    return save_bytes(payload, n);
-}
+uint8_t raid_sensor_values(zinf_ctx_t *ctx, sensor_t *buffer, size_t len) {
+    if (!buffer || len == 0u) return STORAGE_ERR_PARAM;
 
+    uint8_t  header    = 0x01u;
+    size_t   wire_size = len * SENSOR_WIRE_SIZE;
+    uint8_t *wire      = (uint8_t *)malloc(wire_size);
+    if (!wire) return STORAGE_ERR_PARAM;
 
+    for (size_t i = 0; i < len; i++)
+        sensor_to_wire(&wire[i * SENSOR_WIRE_SIZE], &buffer[i]);
 
-uint8_t raid_sensor_values(sensor_t *buffer, size_t len) {
-    uint8_t header = 0x1;  // NOT const, because log expects uint8_t*
-    uint8_t payload[SENSOR_WIRE_SIZE];
-
-    for (size_t i = 0; i < len; i++) {
-        if (sensor_to_u8(payload, sizeof(payload), &buffer[i]) == 0) {
-            return STORAGE_ERR_INVALID_ARG;
-        }
-        uint8_t err = log_raid_u8bit_values(payload, sizeof(payload), &header);
-        if (err != STORAGE_OK) return err;
-    }
-    return STORAGE_OK;
+    uint8_t rc = log_raid_u8bit_values(ctx, wire, wire_size, &header);
+    free(wire);
+    return rc;
 }

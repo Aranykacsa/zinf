@@ -1,3 +1,8 @@
+PYTHON ?= python3
+YAML   ?= ../zinf.yaml
+TOOLS  ?= ../tools
+CFGDIR  = config
+
 CC = gcc
 
 CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
@@ -23,10 +28,19 @@ SRC = \
 
 OUT = zinf_cli
 
+.PHONY: all gen run clean
+
 all: $(OUT)
 
-$(OUT):
+# Regenerate config.h / config.c from zinf.yaml whenever the YAML changes
+$(CFGDIR)/config.h $(CFGDIR)/config.c: $(YAML) $(TOOLS)/zinf_gen.py
+	$(PYTHON) $(TOOLS)/zinf_gen.py $(YAML) $(CFGDIR)/
+
+$(OUT): $(CFGDIR)/config.h
 	$(CC) $(CFLAGS) $(SRC) -o $(OUT)
+
+gen:
+	$(PYTHON) $(TOOLS)/zinf_gen.py $(YAML) $(CFGDIR)/
 
 run: all
 	sudo ./$(OUT) bench

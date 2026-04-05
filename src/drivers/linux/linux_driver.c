@@ -34,7 +34,7 @@ static void *alloc_aligned(size_t size, size_t align) {
 
 // ------------------- Single read ------------------------
 
-static int linux_read(driver_t *self, uint32_t lba, uint8_t *buf)
+static int linux_read(driver_t *self, uint64_t lba, uint8_t *buf)
 {
     linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
 
@@ -52,7 +52,7 @@ static int linux_read(driver_t *self, uint32_t lba, uint8_t *buf)
 
 // ------------------- Single write ------------------------
 
-static int linux_write(driver_t *self, uint32_t lba, const uint8_t *buf)
+static int linux_write(driver_t *self, uint64_t lba, const uint8_t *buf)
 {
     linux_ctx_t *ctx = (linux_ctx_t *)self->ctx;
 
@@ -97,8 +97,8 @@ static int linux_init(driver_t *self)
         self->total_sectors = 0;
     }
 
-    printf("[linux_driver] RAW open %s (fd=%d, sectors=%lu)\n",
-           ctx->path, ctx->fd, (unsigned long)self->total_sectors);
+    fprintf(stderr, "[linux_driver] RAW open %s (fd=%d, sectors=%llu)\n",
+            ctx->path, ctx->fd, (unsigned long long)self->total_sectors);
 
     return DRIVER_OK;
 }
@@ -110,7 +110,7 @@ static void linux_deinit(driver_t *self)
     if (ctx->fd >= 0) close(ctx->fd);
     if (ctx->bounce) free(ctx->bounce);
 
-    printf("[linux_driver] Closed %s\n", ctx->path);
+    fprintf(stderr, "[linux_driver] Closed %s\n", ctx->path);
 }
 
 // ------------------- Global driver ----------------------
@@ -120,6 +120,10 @@ static linux_ctx_t ctx = {
     .path = "/dev/loop0",
     .bounce = NULL
 };
+
+void linux_driver_set_path(const char *path) {
+    ctx.path = path;
+}
 
 driver_t linux_driver = {
     .name          = "linux_raw",

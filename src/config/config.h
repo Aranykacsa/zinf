@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 /* =========================
-   Host-tool constants (bench/reader)
+   Sector geometry
    ========================= */
 #ifndef SECTOR_SIZE
 #define SECTOR_SIZE 512u
@@ -18,68 +18,77 @@
 #define PAYLOAD_SIZE (SECTOR_SIZE - HEADER_SIZE - 4u)
 #endif
 
+/* Default mirror count (used as fallback; overridden at runtime via zinf_ctx) */
 #ifndef RAID_MIRRORS
 #define RAID_MIRRORS 2u
 #endif
 
-/* Host tools compute this (main.c / reader.c) */
-extern uint32_t RAID_OFFSET;
+/* Maximum supported mirror count — raid_read() candidates[] is sized for this */
+#define MAX_MIRRORS 5u
 
 /* =========================
-   Runtime config for core
+   Metadata sector layout (format v3 — 64-bit LBA)
+   ---------------------------------
+   Each of META_COPIES copy-slots holds:
+     [+0..+7]  last_sector (64-bit LE)
+     [+8..+9]  version     (16-bit LE, monotonic)
+   Followed by:
+     [30..31]  write_pos   (16-bit LE)
+     [32]      flags       (1 byte)
+     [33..511] message log payload
    ========================= */
-typedef struct config_t {
-    uint32_t sector_size;     /* bytes */
-    uint8_t  mirror_count;    /* number of mirrors */
-    uint32_t mirror_offset;   /* sectors between mirrors */
-} config_t;
+#define META_COPY_STRIDE    10u                              /* bytes per copy slot */
+#define META_COPIES          3u                              /* redundant copies    */
+#define META_WRITE_POS_OFF  (META_COPIES * META_COPY_STRIDE) /* = 30               */
+#define META_FLAGS_OFF      (META_WRITE_POS_OFF + 2u)        /* = 32               */
+#define META_HDR_SIZE       (META_FLAGS_OFF + 1u)            /* = 33               */
 
-/* Global pointer used by core */
-extern config_t *config;
+/* Message log capacity */
+#define MSG_LOG_CAP_S0      (SECTOR_SIZE - META_HDR_SIZE)           /* 479 bytes  */
+#define MSG_LOG_CAP_S1      SECTOR_SIZE                              /* 512 bytes  */
+#define MSG_LOG_TOTAL_CAP   (MSG_LOG_CAP_S0 + MSG_LOG_CAP_S1)       /* 991 bytes  */
 
-/* Initialize config defaults (and sync with RAID_OFFSET) */
-void config_init_defaults(void);
+/* =========================
+   Storage return codes
+   ========================= */
+#define STORAGE_OK                0u
+#define STORAGE_ERR_PARAM         1u
+#define STORAGE_ERR_DRIVER        2u
+#define STORAGE_ERR_LOG_FULL      3u
+#define STORAGE_ERR_UNRECOVERABLE 4u
 
-/* Call this after changing RAID_OFFSET to keep config->mirror_offset in sync */
-static inline void config_sync_raid_offset(void) {
-    if (config) config->mirror_offset = RAID_OFFSET;
-}
+/* Driver return codes */
+#define DRIVER_OK        0
+#define DRIVER_ERR_IO    1
+#define DRIVER_ERR_INIT  2
+#define DRIVER_ERR_PARAM 3
 
+/* =========================
+   Data types
+   ========================= */
 typedef struct sensor_t {
     float temp;
     float humidity;
 } sensor_t;
 
-#pragma once
-#include <stdint.h>
-#include <stddef.h>
-
-/* ---- Storage return codes ---- */
-#define STORAGE_OK             0
-#define STORAGE_ERR_PARAM      1
-#define STORAGE_ERR_DRIVER     2
-#define STORAGE_ERR_LOG_FULL   3
-
-/* Driver return codes (must match your driver implementation) */
-#define DRIVER_OK              0
-
-/* ---- External state (defined in main.c / platform) ---- */
+/* =========================
+   Runtime context
+   ========================= */
 struct driver_t;
-extern struct driver_t *active_driver;
-extern uint32_t log_sector;
 
-/* ---- Storage low-level I/O (implemented in core/data/data.c) ---- */
-int read_sector(uint32_t sector, uint8_t *buffer);
-int write_sector(uint32_t sector, const uint8_t *buffer);
+typedef struct zinf_ctx_t {
+    struct driver_t *driver;
+    uint32_t         sector_size;      /* bytes per sector (default SECTOR_SIZE) */
+    uint8_t          mirror_count;     /* number of RAID mirrors                 */
+    uint8_t          metadata_sectors; /* sectors reserved for metadata          */
+    uint64_t         mirror_offset;    /* sectors between mirror copies          */
+    uint64_t         log_sector;       /* LBA of metadata sector (default 0)     */
+    uint64_t         raid_offset;      /* runtime-computed mirror spacing        */
+} zinf_ctx_t;
 
-/* ---- Public API (implemented in core/data/data.c) ---- */
-uint8_t setup_storage(void);
+/* Default global instance (set by platform file) */
+extern zinf_ctx_t *zinf_ctx;
 
-/* “msg log” API */
-uint8_t save_msg(uint8_t *msg);
-uint8_t test_save_msg(void);
-
-/* Log init + writers (compatible names) */
-uint8_t init_log_sector(void);
-uint8_t raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header);
-uint8_t save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header);
+/* Initialise *ctx from compile-time defaults.
+   Caller must set ctx->driver before calling this. */
+void zinf_ctx_init_defaults(zinf_ctx_t *ctx);

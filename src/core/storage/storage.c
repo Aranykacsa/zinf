@@ -1,5 +1,4 @@
 #include "storage.h"
-
 #include "driver.h"
 #include "config.h"
 #include "helper.h"
@@ -9,194 +8,214 @@
 #include <string.h>
 #include <stdlib.h>
 
-extern driver_t *active_driver;
-extern uint32_t log_sector;
+/* -----------------------------------------------------------------------
+   Internal helpers
+   ----------------------------------------------------------------------- */
 
-static int write_sectors(uint32_t start_sector, const uint8_t *buffer, uint32_t count) {
-    if (active_driver->write_blocks != NULL) {
-        return active_driver->write_blocks(active_driver, start_sector, buffer, count);
-    }
+static int ctx_read_sector(zinf_ctx_t *ctx, uint64_t lba, uint8_t *buf) {
+    if (ctx->driver->read_blocks)
+        return ctx->driver->read_blocks(ctx->driver, lba, buf, 1);
+    return ctx->driver->read_block(ctx->driver, lba, buf);
+}
+
+static int ctx_write_sector(zinf_ctx_t *ctx, uint64_t lba, const uint8_t *buf) {
+    if (ctx->driver->write_blocks)
+        return ctx->driver->write_blocks(ctx->driver, lba, buf, 1);
+    return ctx->driver->write_block(ctx->driver, lba, buf);
+}
+
+static int write_sectors(zinf_ctx_t *ctx, uint64_t start, const uint8_t *buf, uint32_t count) {
+    if (ctx->driver->write_blocks)
+        return ctx->driver->write_blocks(ctx->driver, start, buf, count);
 
     for (uint32_t i = 0; i < count; i++) {
-        int rc = active_driver->write_block(
-            active_driver,
-            start_sector + i,
-            buffer + (i * config->sector_size)
-        );
+        int rc = ctx->driver->write_block(ctx->driver, start + i,
+                                          buf + (i * ctx->sector_size));
         if (rc != DRIVER_OK) return rc;
     }
     return DRIVER_OK;
 }
 
-uint8_t log_get_last_sector(uint32_t *last_sector) {
+/* -----------------------------------------------------------------------
+   Metadata: last-sector pointer with 3 redundant copies + versioning
+   Layout of sector ctx->log_sector (format v3 — 64-bit LBA):
+     Copy i (i = 0..META_COPIES-1) starts at byte i*META_COPY_STRIDE:
+       [+0..+7] last_sector (uint64 LE)
+       [+8..+9] version     (uint16 LE, monotonic)
+     [META_WRITE_POS_OFF..+1]  write_pos (uint16 LE)
+     [META_FLAGS_OFF]           flags     (uint8)
+     [META_HDR_SIZE..511]       message log payload
+   ----------------------------------------------------------------------- */
+
+uint8_t log_get_last_sector(zinf_ctx_t *ctx, uint64_t *last_sector) {
     if (!last_sector) return STORAGE_ERR_PARAM;
 
-    uint8_t buffer[SECTOR_SIZE];
-    int rc = read_sector(log_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    uint8_t buf[SECTOR_SIZE];
+    if (ctx_read_sector(ctx, ctx->log_sector, buf) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
-    *last_sector =
-        ((uint32_t)buffer[0])       |
-        ((uint32_t)buffer[1] << 8)  |
-        ((uint32_t)buffer[2] << 16);
+    /* Pick the copy with the newest version counter.
+       Comparison uses modular arithmetic so the counter wraps correctly:
+       ver_a is newer than ver_b iff (uint16_t)(ver_a - ver_b) < 0x8000u */
+    uint16_t best_ver = 0;
+    uint64_t best_val = 0;
 
+    for (uint8_t i = 0; i < META_COPIES; i++) {
+        uint16_t off = (uint16_t)(i * META_COPY_STRIDE);
+        uint64_t val = (uint64_t)buf[off]
+                     | ((uint64_t)buf[off + 1] << 8)
+                     | ((uint64_t)buf[off + 2] << 16)
+                     | ((uint64_t)buf[off + 3] << 24)
+                     | ((uint64_t)buf[off + 4] << 32)
+                     | ((uint64_t)buf[off + 5] << 40)
+                     | ((uint64_t)buf[off + 6] << 48)
+                     | ((uint64_t)buf[off + 7] << 56);
+        uint16_t ver = (uint16_t)buf[off + 8]
+                     | ((uint16_t)buf[off + 9] << 8);
+
+        /* i==0: unconditional first assignment; otherwise pick newer version */
+        if (i == 0 || (uint16_t)(ver - best_ver) < 0x8000u) {
+            best_ver = ver;
+            best_val = val;
+        }
+    }
+
+    *last_sector = best_val;
     return STORAGE_OK;
 }
 
-uint8_t log_set_last_sector(const uint32_t *last_sector) {
+uint8_t log_set_last_sector(zinf_ctx_t *ctx, const uint64_t *last_sector) {
     if (!last_sector) return STORAGE_ERR_PARAM;
 
-    uint8_t buffer[SECTOR_SIZE];
-    int rc = read_sector(log_sector, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    uint8_t buf[SECTOR_SIZE];
+    if (ctx_read_sector(ctx, ctx->log_sector, buf) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
 
-    buffer[0] = (uint8_t)(*last_sector & 0xFF);
-    buffer[1] = (uint8_t)((*last_sector >> 8) & 0xFF);
-    buffer[2] = (uint8_t)((*last_sector >> 16) & 0xFF);
+    /* Find the slot with the newest version (modular comparison) */
+    uint16_t max_ver  = 0;
+    uint8_t  max_slot = 0;
 
-    rc = write_sector(log_sector, buffer);
-    return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
+    for (uint8_t i = 0; i < META_COPIES; i++) {
+        uint16_t off = (uint16_t)(i * META_COPY_STRIDE);
+        uint16_t ver = (uint16_t)buf[off + 8]
+                     | ((uint16_t)buf[off + 9] << 8);
+        if (i == 0 || (uint16_t)(ver - max_ver) < 0x8000u) {
+            max_ver  = ver;
+            max_slot = i;
+        }
+    }
+
+    /* Write to the NEXT slot (round-robin) with version = max+1. */
+    uint8_t  next_slot = (uint8_t)((max_slot + 1u) % META_COPIES);
+    uint16_t next_ver  = (uint16_t)(max_ver + 1u);
+    uint16_t off       = (uint16_t)(next_slot * META_COPY_STRIDE);
+
+    buf[off]     = (uint8_t)(*last_sector & 0xFFu);
+    buf[off + 1] = (uint8_t)((*last_sector >> 8)  & 0xFFu);
+    buf[off + 2] = (uint8_t)((*last_sector >> 16) & 0xFFu);
+    buf[off + 3] = (uint8_t)((*last_sector >> 24) & 0xFFu);
+    buf[off + 4] = (uint8_t)((*last_sector >> 32) & 0xFFu);
+    buf[off + 5] = (uint8_t)((*last_sector >> 40) & 0xFFu);
+    buf[off + 6] = (uint8_t)((*last_sector >> 48) & 0xFFu);
+    buf[off + 7] = (uint8_t)((*last_sector >> 56) & 0xFFu);
+    buf[off + 8] = (uint8_t)(next_ver & 0xFFu);
+    buf[off + 9] = (uint8_t)((next_ver >> 8) & 0xFFu);
+
+    if (ctx_write_sector(ctx, ctx->log_sector, buf) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
+    return STORAGE_OK;
 }
 
-uint8_t log_init_log_sector(void) {
-    uint8_t buffer[SECTOR_SIZE];
-    memset(buffer, 0, sizeof(buffer));
+uint8_t log_init_log_sector(zinf_ctx_t *ctx) {
+    uint8_t buf[SECTOR_SIZE];
+    memset(buf, 0, sizeof(buf));
 
-    int rc = write_sector(log_sector + 1, buffer);
-    if (rc != DRIVER_OK) return STORAGE_ERR_DRIVER;
+    uint8_t meta_sects = (ctx->metadata_sectors > 0) ? ctx->metadata_sectors : 2u;
 
-    memset(buffer, 0, sizeof(buffer));
-
-    const uint32_t start_sector = 1;
-    const uint16_t last_msg     = 0;
-
-    buffer[0] = (uint8_t)(start_sector & 0xFF);
-    buffer[1] = (uint8_t)((start_sector >> 8) & 0xFF);
-    buffer[2] = (uint8_t)((start_sector >> 16) & 0xFF);
-    buffer[3] = (uint8_t)(last_msg & 0xFF);
-    buffer[4] = (uint8_t)((last_msg >> 8) & 0xFF);
-    buffer[5] = 0; /* is_first_full = 0 */
-
-    rc = write_sector(log_sector, buffer);
-    return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
+    /* Zero all reserved metadata sectors */
+    for (uint8_t s = 0; s < meta_sects; s++) {
+        if (ctx_write_sector(ctx, ctx->log_sector + s, buf) != DRIVER_OK)
+            return STORAGE_ERR_DRIVER;
+    }
+    return STORAGE_OK;
 }
 
-uint8_t log_raid_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
+/* -----------------------------------------------------------------------
+   RAID write
+   ----------------------------------------------------------------------- */
+
+uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint8_t *header) {
     if (!buffer || !header) return STORAGE_ERR_PARAM;
 
-    uint32_t last_log_index = 0;
-    uint8_t rc = log_get_last_sector(&last_log_index);
+    uint64_t last_log_index = 0;
+    uint8_t  rc = log_get_last_sector(ctx, &last_log_index);
     if (rc != STORAGE_OK) return rc;
 
-    uint32_t num_chunks        = (uint32_t)(len / PAYLOAD_SIZE);
-    uint32_t base_write_cursor = last_log_index + 1;
+    /* Ceiling division: a partial tail fills one extra sector with zero padding */
+    uint32_t num_chunks        = (len > 0u)
+                                 ? (uint32_t)((len + PAYLOAD_SIZE - 1u) / PAYLOAD_SIZE)
+                                 : 0u;
+    if (num_chunks == 0u) return STORAGE_OK;
 
-    size_t total_buffer_size = (size_t)num_chunks * config->sector_size;
-    uint8_t *bulk_buffer = (uint8_t*)malloc(total_buffer_size);
+    uint64_t base_write_cursor = last_log_index + 1u;
+
+    size_t   total_size  = (size_t)num_chunks * ctx->sector_size;
+    uint8_t *bulk_buffer = (uint8_t *)malloc(total_size);
 
     if (bulk_buffer != NULL) {
+        /* Build all sectors in one allocation */
         for (uint32_t i = 0; i < num_chunks; i++) {
-            uint8_t *sector_ptr = &bulk_buffer[i * config->sector_size];
-
-            memset(sector_ptr, 0, config->sector_size);
-            sector_ptr[0] = *header;
-
-            memcpy(&sector_ptr[1],
-                   &buffer[i * PAYLOAD_SIZE],
-                   PAYLOAD_SIZE);
-
-            uint32_t crc = crc32(sector_ptr, HEADER_SIZE + PAYLOAD_SIZE);
-
-            sector_ptr[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
-            sector_ptr[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
-            sector_ptr[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
-            sector_ptr[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
+            uint8_t *sp = &bulk_buffer[i * ctx->sector_size];
+            memset(sp, 0, ctx->sector_size);
+            sp[0] = *header;
+            size_t src_off   = (size_t)i * PAYLOAD_SIZE;
+            size_t chunk_len = (src_off + PAYLOAD_SIZE <= len)
+                               ? PAYLOAD_SIZE : (len - src_off);
+            memcpy(&sp[1], &buffer[src_off], chunk_len);
+            uint32_t crc = crc32(sp, HEADER_SIZE + PAYLOAD_SIZE);
+            sp[ctx->sector_size - 4] = (uint8_t)(crc & 0xFFu);
+            sp[ctx->sector_size - 3] = (uint8_t)((crc >> 8)  & 0xFFu);
+            sp[ctx->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFFu);
+            sp[ctx->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFFu);
         }
 
-        for (uint8_t m = 0; m < config->mirror_count; m++) {
-            uint32_t physical_start_addr =
-                base_write_cursor + (uint32_t)m * config->mirror_offset;
-
-            int drv_rc = write_sectors(physical_start_addr, bulk_buffer, num_chunks);
-            if (drv_rc != DRIVER_OK) {
+        for (uint8_t m = 0; m < ctx->mirror_count; m++) {
+            uint64_t phys = base_write_cursor + (uint64_t)m * ctx->mirror_offset;
+            if (write_sectors(ctx, phys, bulk_buffer, num_chunks) != DRIVER_OK) {
                 free(bulk_buffer);
                 return STORAGE_ERR_DRIVER;
             }
         }
-
         free(bulk_buffer);
+    } else {
+        /* Low-RAM fallback: sector-by-sector */
+        uint8_t  sector_buf[SECTOR_SIZE];
+        uint64_t cursor = base_write_cursor;
 
-        uint32_t new_last_sector = base_write_cursor + num_chunks - 1;
-        return log_set_last_sector(&new_last_sector);
-    }
+        for (uint32_t i = 0; i < num_chunks; i++) {
+            memset(sector_buf, 0, sizeof(sector_buf));
+            sector_buf[0] = *header;
+            size_t src_off   = (size_t)i * PAYLOAD_SIZE;
+            size_t chunk_len = (src_off + PAYLOAD_SIZE <= len)
+                               ? PAYLOAD_SIZE : (len - src_off);
+            memcpy(&sector_buf[1], &buffer[src_off], chunk_len);
+            uint32_t crc = crc32(sector_buf, HEADER_SIZE + PAYLOAD_SIZE);
+            sector_buf[ctx->sector_size - 4] = (uint8_t)(crc & 0xFFu);
+            sector_buf[ctx->sector_size - 3] = (uint8_t)((crc >> 8)  & 0xFFu);
+            sector_buf[ctx->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFFu);
+            sector_buf[ctx->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFFu);
 
-    /* Low-RAM fallback: sector-by-sector */
-    uint8_t sector_buffer[SECTOR_SIZE];
-    uint32_t current_cursor = base_write_cursor;
-
-    for (uint32_t i = 0; i < num_chunks; i++) {
-        memset(sector_buffer, 0, sizeof(sector_buffer));
-        sector_buffer[0] = *header;
-
-        memcpy(&sector_buffer[1],
-               &buffer[i * PAYLOAD_SIZE],
-               PAYLOAD_SIZE);
-
-        uint32_t crc = crc32(sector_buffer, HEADER_SIZE + PAYLOAD_SIZE);
-
-        sector_buffer[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
-        sector_buffer[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
-        sector_buffer[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
-        sector_buffer[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
-
-        for (uint8_t m = 0; m < config->mirror_count; m++) {
-            uint32_t physical_addr =
-                current_cursor + (uint32_t)m * config->mirror_offset;
-
-            int rcw = write_sector(physical_addr, sector_buffer);
-            if (rcw != DRIVER_OK) return STORAGE_ERR_DRIVER;
+            for (uint8_t m = 0; m < ctx->mirror_count; m++) {
+                uint64_t phys = cursor + (uint64_t)m * ctx->mirror_offset;
+                if (ctx_write_sector(ctx, phys, sector_buf) != DRIVER_OK)
+                    return STORAGE_ERR_DRIVER;
+            }
+            cursor++;
         }
-
-        current_cursor++;
+        uint64_t new_last = cursor - 1u;
+        return log_set_last_sector(ctx, &new_last);
     }
 
-    uint32_t new_last_sector = current_cursor - 1;
-    return log_set_last_sector(&new_last_sector);
-}
-
-/* non-RAID compat */
-uint8_t log_save_u8bit_values(uint8_t *buffer, size_t len, uint8_t *header) {
-    if (!buffer || !header) return STORAGE_ERR_PARAM;
-    if (len % PAYLOAD_SIZE != 0) return STORAGE_ERR_PARAM;
-
-    uint32_t last_sector = 0;
-    uint8_t rc = log_get_last_sector(&last_sector);
-    if (rc != STORAGE_OK) return rc;
-
-    uint16_t num_of_sectors = (uint16_t)(len / PAYLOAD_SIZE);
-    uint32_t new_sector     = last_sector;
-
-    uint8_t sector_buffer[SECTOR_SIZE];
-
-    for (uint16_t i = 0; i < num_of_sectors; i++) {
-        new_sector++;
-
-        memset(sector_buffer, 0, sizeof(sector_buffer));
-        sector_buffer[0] = *header;
-
-        memcpy(&sector_buffer[1], &buffer[i * PAYLOAD_SIZE], PAYLOAD_SIZE);
-
-        uint32_t crc = crc32(sector_buffer, HEADER_SIZE + PAYLOAD_SIZE);
-
-        sector_buffer[config->sector_size - 4] = (uint8_t)(crc & 0xFF);
-        sector_buffer[config->sector_size - 3] = (uint8_t)((crc >> 8) & 0xFF);
-        sector_buffer[config->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFF);
-        sector_buffer[config->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFF);
-
-        int rcw = write_sector(new_sector, sector_buffer);
-        if (rcw != DRIVER_OK) return STORAGE_ERR_DRIVER;
-    }
-
-    rc = log_set_last_sector(&new_sector);
-    return (rc == STORAGE_OK) ? STORAGE_OK : rc;
+    uint64_t new_last = base_write_cursor + num_chunks - 1u;
+    return log_set_last_sector(ctx, &new_last);
 }

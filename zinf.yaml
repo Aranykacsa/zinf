@@ -1,0 +1,15 @@
+# ZINF configuration
+# Edit this file and run `python3 tools/zinf_gen.py zinf.yaml src/config/`
+# to regenerate src/config/config.h and src/config/config.c
+
+zinf:
+  sector_size: 512        # bytes per physical sector
+  mirror_count: 2         # RAID mirror count (must be odd for majority voting; 1 disables RAID)
+  header_size: 1          # per-sector header bytes (type tag)
+  metadata_sectors: 2     # sectors reserved for metadata (sector 0 + overflow sector)
+
+  data_types:
+    - name: sensor_t
+      fields:
+        - { name: temp,     type: float }
+        - { name: humidity, type: float }
