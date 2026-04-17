@@ -47,6 +47,7 @@ def validate(cfg: dict) -> dict:
     mirror_count     = int(z.get("mirror_count",     2))
     header_size      = int(z.get("header_size",      1))
     metadata_sectors = int(z.get("metadata_sectors", 2))
+    max_bad_sectors  = int(z.get("max_bad_sectors",  16))
 
     if sector_size < 64 or sector_size > 65536:
         sys.exit(f"error: sector_size={sector_size} out of range [64, 65536]")
@@ -56,6 +57,8 @@ def validate(cfg: dict) -> dict:
         sys.exit(f"error: mirror_count must be >= 1")
     if metadata_sectors < 2:
         sys.exit(f"error: metadata_sectors must be >= 2")
+    if max_bad_sectors < 1 or max_bad_sectors > 255:
+        sys.exit(f"error: max_bad_sectors={max_bad_sectors} out of range [1, 255]")
     if mirror_count > 1 and mirror_count % 2 == 0:
         print(f"warning: mirror_count={mirror_count} is even — majority voting disabled; "
               "consider an odd value", file=sys.stderr)
@@ -92,6 +95,7 @@ def validate(cfg: dict) -> dict:
         "mirror_count":     mirror_count,
         "header_size":      header_size,
         "metadata_sectors": metadata_sectors,
+        "max_bad_sectors":  max_bad_sectors,
         "data_types":       parsed_types,
     }
 
@@ -113,6 +117,7 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
     mirror_count     = cfg["mirror_count"]
     header_size      = cfg["header_size"]
     metadata_sectors = cfg["metadata_sectors"]
+    max_bad_sectors  = cfg["max_bad_sectors"]
 
     # Derived metadata constants (format v3 — 64-bit LBA per copy slot)
     meta_copy_stride   = 10   # 8 bytes LBA + 2 bytes version
@@ -128,6 +133,7 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         "#pragma once",
         "#include <stdint.h>",
         "#include <stddef.h>",
+        "#include <stdbool.h>",
         "",
         "/* =========================",
         "   Sector geometry",
@@ -152,6 +158,9 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         "",
         "/* Maximum supported mirror count — raid_read() candidates[] is sized for this */",
         "#define MAX_MIRRORS 5u",
+        "",
+        "/* Bad-sector blacklist capacity in zinf_ctx_t (from zinf.yaml max_bad_sectors) */",
+        f"#define MAX_BAD_SECTORS {max_bad_sectors}u",
         "",
         "/* =========================",
         "   Metadata sector layout (format v3 — 64-bit LBA)",
@@ -183,6 +192,8 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         "#define STORAGE_ERR_DRIVER        2u",
         "#define STORAGE_ERR_LOG_FULL      3u",
         "#define STORAGE_ERR_UNRECOVERABLE 4u",
+        "/* Non-fatal: write committed to >=1 mirror but fewer than mirror_count */",
+        "#define STORAGE_WARN_DEGRADED     5u",
         "",
         "/* Driver return codes */",
         "#define DRIVER_OK        0",
@@ -216,6 +227,9 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         "    uint64_t         mirror_offset;    /* sectors between mirror copies          */",
         "    uint64_t         log_sector;       /* LBA of metadata sector (default 0)     */",
         "    uint64_t         raid_offset;      /* runtime-computed mirror spacing        */",
+        "    /* bad-sector blacklist — RAM only; rebuilt via zinf_scrub() at startup */",
+        "    uint64_t         bad_sectors[MAX_BAD_SECTORS];",
+        "    uint8_t          bad_sector_count;",
         "} zinf_ctx_t;",
         "",
         "/* Default global instance (set by platform file) */",
@@ -224,6 +238,26 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         "/* Initialise *ctx from compile-time defaults.",
         "   Caller must set ctx->driver before calling this. */",
         "void zinf_ctx_init_defaults(zinf_ctx_t *ctx);",
+        "",
+        "/* =========================",
+        "   Bad-sector blacklist helpers (static inline — available everywhere config.h is included)",
+        "   ========================= */",
+        "static inline bool zinf_is_bad_sector(const zinf_ctx_t *ctx, uint64_t lba) {",
+        "    for (uint8_t _i = 0; _i < ctx->bad_sector_count; _i++)",
+        "        if (ctx->bad_sectors[_i] == lba) return true;",
+        "    return false;",
+        "}",
+        "",
+        "static inline uint8_t zinf_mark_bad_sector(zinf_ctx_t *ctx, uint64_t lba) {",
+        "    if (zinf_is_bad_sector(ctx, lba))             return STORAGE_OK;",
+        "    if (ctx->bad_sector_count >= MAX_BAD_SECTORS) return STORAGE_ERR_PARAM;",
+        "    ctx->bad_sectors[ctx->bad_sector_count++] = lba;",
+        "    return STORAGE_OK;",
+        "}",
+        "",
+        "static inline void zinf_clear_bad_sectors(zinf_ctx_t *ctx) {",
+        "    ctx->bad_sector_count = 0u;",
+        "}",
         "",
     ]
 
@@ -284,6 +318,7 @@ def gen_config_c(cfg: dict, out_path: str) -> None:
         "    ctx->log_sector       = 0u;",
         "    if (ctx->raid_offset == 0u) ctx->raid_offset = 30u;",
         "    ctx->mirror_offset    = ctx->raid_offset;",
+        "    ctx->bad_sector_count = 0u;",
         "}",
         "",
     ]

@@ -60,13 +60,15 @@ uint8_t raid_read(zinf_ctx_t *ctx, uint64_t logical_sector, uint8_t *payload) {
     for (uint8_t m = 0; m < limit; m++) {
         uint64_t phys = logical_sector + (uint64_t)m * ctx->mirror_offset;
 
+        if (zinf_is_bad_sector(ctx, phys)) continue;  /* skip blacklisted mirror */
+
         if (read_sector(ctx, phys, raw) != DRIVER_OK) continue;
 
         uint32_t stored = (uint32_t)raw[ctx->sector_size - 4]
                         | ((uint32_t)raw[ctx->sector_size - 3] << 8)
                         | ((uint32_t)raw[ctx->sector_size - 2] << 16)
                         | ((uint32_t)raw[ctx->sector_size - 1] << 24);
-        uint32_t calc = crc32(raw, HEADER_SIZE + PAYLOAD_SIZE);
+        uint32_t calc = zinf_crc32(raw, HEADER_SIZE + PAYLOAD_SIZE);
 
         if (calc == stored) {
             memcpy(&candidates[valid_count * PAYLOAD_SIZE],
@@ -206,4 +208,167 @@ uint8_t raid_sensor_values(zinf_ctx_t *ctx, sensor_t *buffer, size_t len) {
     uint8_t rc = log_raid_u8bit_values(ctx, wire, wire_size, &header);
     free(wire);
     return rc;
+}
+
+/* -----------------------------------------------------------------------
+   Fault detection and recovery
+   ----------------------------------------------------------------------- */
+
+/* Read all mirrors for logical_sector and verify CRC on each.
+   No writes, no blacklist mutations — pure diagnostic read. */
+uint8_t zinf_check_sector(zinf_ctx_t *ctx, uint64_t logical_sector,
+                           zinf_sector_health_t *out) {
+    if (!ctx || !out) return STORAGE_ERR_PARAM;
+
+    uint8_t raw[SECTOR_SIZE];
+    uint8_t limit = (ctx->mirror_count < MAX_MIRRORS)
+                    ? ctx->mirror_count : (uint8_t)MAX_MIRRORS;
+
+    out->valid_count = 0u;
+    for (uint8_t m = 0; m < MAX_MIRRORS; m++)
+        out->status[m] = ZINF_MIRROR_IO_ERR;  /* safe default */
+
+    for (uint8_t m = 0; m < limit; m++) {
+        uint64_t phys = logical_sector + (uint64_t)m * ctx->mirror_offset;
+
+        if (zinf_is_bad_sector(ctx, phys)) {
+            out->status[m] = ZINF_MIRROR_BLACKLIST;
+            continue;
+        }
+
+        if (read_sector(ctx, phys, raw) != DRIVER_OK) {
+            out->status[m] = ZINF_MIRROR_IO_ERR;
+            continue;
+        }
+
+        uint32_t stored = (uint32_t)raw[ctx->sector_size - 4]
+                        | ((uint32_t)raw[ctx->sector_size - 3] << 8)
+                        | ((uint32_t)raw[ctx->sector_size - 2] << 16)
+                        | ((uint32_t)raw[ctx->sector_size - 1] << 24);
+        uint32_t calc = zinf_crc32(raw, HEADER_SIZE + PAYLOAD_SIZE);
+
+        if (calc == stored) {
+            out->status[m] = ZINF_MIRROR_OK;
+            out->valid_count++;
+        } else {
+            out->status[m] = ZINF_MIRROR_CRC_FAIL;
+        }
+    }
+
+    return STORAGE_OK;
+}
+
+/* Repair bad mirrors by copying from the best valid mirror.
+   For each mirror that fails: write good copy, re-read, re-verify CRC.
+   If re-verify fails: blacklist that physical LBA permanently. */
+uint8_t zinf_recover_sector(zinf_ctx_t *ctx, uint64_t logical_sector) {
+    if (!ctx) return STORAGE_ERR_PARAM;
+
+    zinf_sector_health_t health;
+    zinf_check_sector(ctx, logical_sector, &health);
+
+    /* Find the first valid mirror to use as repair source */
+    uint8_t limit = (ctx->mirror_count < MAX_MIRRORS)
+                    ? ctx->mirror_count : (uint8_t)MAX_MIRRORS;
+    int8_t  good_mirror = -1;
+
+    for (uint8_t m = 0; m < limit; m++) {
+        if (health.status[m] == ZINF_MIRROR_OK) {
+            good_mirror = (int8_t)m;
+            break;
+        }
+    }
+
+    if (good_mirror < 0) {
+        /* No valid mirror — blacklist all non-already-blacklisted LBAs */
+        for (uint8_t m = 0; m < limit; m++) {
+            if (health.status[m] != ZINF_MIRROR_BLACKLIST)
+                zinf_mark_bad_sector(ctx, logical_sector + (uint64_t)m * ctx->mirror_offset);
+        }
+        return STORAGE_ERR_UNRECOVERABLE;
+    }
+
+    /* Read the full sector from the good mirror (header + payload + CRC) */
+    uint8_t  good_buf[SECTOR_SIZE];
+    uint64_t good_phys = logical_sector + (uint64_t)good_mirror * ctx->mirror_offset;
+    if (read_sector(ctx, good_phys, good_buf) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
+
+    /* Repair each bad mirror */
+    uint8_t verify_buf[SECTOR_SIZE];
+    for (uint8_t m = 0; m < limit; m++) {
+        if (health.status[m] == ZINF_MIRROR_OK)        continue;
+        if (health.status[m] == ZINF_MIRROR_BLACKLIST)  continue;
+
+        uint64_t phys = logical_sector + (uint64_t)m * ctx->mirror_offset;
+
+        /* Step 1: write repair */
+        if (write_sector(ctx, phys, good_buf) != DRIVER_OK) {
+            zinf_mark_bad_sector(ctx, phys);
+            continue;
+        }
+
+        /* Step 2: re-read and re-verify CRC */
+        if (read_sector(ctx, phys, verify_buf) != DRIVER_OK) {
+            zinf_mark_bad_sector(ctx, phys);
+            continue;
+        }
+        uint32_t stored = (uint32_t)verify_buf[ctx->sector_size - 4]
+                        | ((uint32_t)verify_buf[ctx->sector_size - 3] << 8)
+                        | ((uint32_t)verify_buf[ctx->sector_size - 2] << 16)
+                        | ((uint32_t)verify_buf[ctx->sector_size - 1] << 24);
+        uint32_t calc = zinf_crc32(verify_buf, HEADER_SIZE + PAYLOAD_SIZE);
+        if (calc != stored)
+            zinf_mark_bad_sector(ctx, phys);
+    }
+
+    return STORAGE_OK;
+}
+
+/* Scan logical sectors [start..end] inclusive, check and recover each.
+   Continues past unrecoverable sectors — never stops early. */
+uint8_t zinf_scrub(zinf_ctx_t *ctx, uint64_t start, uint64_t end,
+                   zinf_scrub_report_t *report) {
+    if (!ctx) return STORAGE_ERR_PARAM;
+
+    if (report) {
+        report->checked       = 0u;
+        report->healthy       = 0u;
+        report->repaired      = 0u;
+        report->unrecoverable = 0u;
+    }
+
+    for (uint64_t logical = start; logical <= end; logical++) {
+        /* Check first (no side effects) to distinguish healthy from repaired */
+        zinf_sector_health_t health;
+        zinf_check_sector(ctx, logical, &health);
+
+        if (report) report->checked++;
+
+        uint8_t limit = (ctx->mirror_count < MAX_MIRRORS)
+                        ? ctx->mirror_count : (uint8_t)MAX_MIRRORS;
+
+        /* Count how many mirrors were OK before any repair attempt */
+        uint8_t ok_before = health.valid_count;
+        /* Count non-blacklisted mirrors to determine "fully healthy" */
+        uint8_t active = 0u;
+        for (uint8_t m = 0; m < limit; m++)
+            if (health.status[m] != ZINF_MIRROR_BLACKLIST) active++;
+
+        if (ok_before == active && active > 0u) {
+            /* All active mirrors healthy — no repair needed */
+            if (report) report->healthy++;
+            continue;
+        }
+
+        uint8_t rc = zinf_recover_sector(ctx, logical);
+        if (report) {
+            if (rc == STORAGE_ERR_UNRECOVERABLE)
+                report->unrecoverable++;
+            else
+                report->repaired++;
+        }
+    }
+
+    return STORAGE_OK;
 }

@@ -12,6 +12,7 @@ void zinf_ctx_init_defaults(zinf_ctx_t *ctx) {
     ctx->log_sector       = 0u;
     if (ctx->raid_offset == 0u) ctx->raid_offset = 30u;
     ctx->mirror_offset    = ctx->raid_offset;
+    ctx->bad_sector_count = 0u;
 }
 
 /* Pack sensor_t into wire format (little-endian). */

@@ -26,7 +26,19 @@ SRC = runner.c \
 
 OUT = run_tests
 
-.PHONY: all run clean
+CSV_SRC = test_fault_csv.c \
+          $(SRCDIR)/config/config.c \
+          $(SRCDIR)/core/api/api.c \
+          $(SRCDIR)/core/storage/storage.c \
+          $(SRCDIR)/core/helper/helper.c \
+          $(SRCDIR)/drivers/linux/linux_driver.c \
+          $(SRCDIR)/platform/platform_linux.c
+
+CSV_OUT = run_fault_csv
+
+XLSX_LIBS := $(shell pkg-config --libs xlsxwriter 2>/dev/null || echo -lxlsxwriter)
+
+.PHONY: all run csv csv-fuzz clean
 
 all: $(OUT)
 
@@ -36,5 +48,15 @@ $(OUT):
 run: $(OUT)
 	./$(OUT)
 
+$(CSV_OUT): $(CSV_SRC)
+	$(CC) $(CFLAGS) $(CSV_SRC) -o $(CSV_OUT) $(XLSX_LIBS)
+
+csv: $(CSV_OUT)
+	./$(CSV_OUT) -s fault_scenarios.csv -o fault_results.xlsx
+
+csv-fuzz: $(CSV_OUT)
+	./$(CSV_OUT) -s fault_scenarios.csv -o fault_results_fuzz.xlsx -n 100 -K 5 -v
+
 clean:
-	rm -f $(OUT) /var/tmp/zinf_test.img /var/tmp/zinf_fault.img
+	rm -f $(OUT) $(CSV_OUT) fault_results.xlsx fault_results_fuzz.xlsx \
+	      /var/tmp/zinf_test.img /var/tmp/zinf_fault.img /var/tmp/zinf_csv_fault.img

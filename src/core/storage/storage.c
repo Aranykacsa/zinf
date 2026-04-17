@@ -24,17 +24,6 @@ static int ctx_write_sector(zinf_ctx_t *ctx, uint64_t lba, const uint8_t *buf) {
     return ctx->driver->write_block(ctx->driver, lba, buf);
 }
 
-static int write_sectors(zinf_ctx_t *ctx, uint64_t start, const uint8_t *buf, uint32_t count) {
-    if (ctx->driver->write_blocks)
-        return ctx->driver->write_blocks(ctx->driver, start, buf, count);
-
-    for (uint32_t i = 0; i < count; i++) {
-        int rc = ctx->driver->write_block(ctx->driver, start + i,
-                                          buf + (i * ctx->sector_size));
-        if (rc != DRIVER_OK) return rc;
-    }
-    return DRIVER_OK;
-}
 
 /* -----------------------------------------------------------------------
    Metadata: last-sector pointer with 3 redundant copies + versioning
@@ -162,6 +151,9 @@ uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint
     size_t   total_size  = (size_t)num_chunks * ctx->sector_size;
     uint8_t *bulk_buffer = (uint8_t *)malloc(total_size);
 
+    uint8_t any_degraded = 0u;  /* set if any mirror LBA was blacklisted and skipped */
+    uint8_t any_written  = 0u;  /* set if at least one sector was actually written   */
+
     if (bulk_buffer != NULL) {
         /* Build all sectors in one allocation */
         for (uint32_t i = 0; i < num_chunks; i++) {
@@ -172,18 +164,27 @@ uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint
             size_t chunk_len = (src_off + PAYLOAD_SIZE <= len)
                                ? PAYLOAD_SIZE : (len - src_off);
             memcpy(&sp[1], &buffer[src_off], chunk_len);
-            uint32_t crc = crc32(sp, HEADER_SIZE + PAYLOAD_SIZE);
+            uint32_t crc = zinf_crc32(sp, HEADER_SIZE + PAYLOAD_SIZE);
             sp[ctx->sector_size - 4] = (uint8_t)(crc & 0xFFu);
             sp[ctx->sector_size - 3] = (uint8_t)((crc >> 8)  & 0xFFu);
             sp[ctx->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFFu);
             sp[ctx->sector_size - 1] = (uint8_t)((crc >> 24) & 0xFFu);
         }
 
+        /* Write to all mirrors sector-by-sector to allow per-LBA blacklist checks */
         for (uint8_t m = 0; m < ctx->mirror_count; m++) {
-            uint64_t phys = base_write_cursor + (uint64_t)m * ctx->mirror_offset;
-            if (write_sectors(ctx, phys, bulk_buffer, num_chunks) != DRIVER_OK) {
-                free(bulk_buffer);
-                return STORAGE_ERR_DRIVER;
+            uint64_t phys_start = base_write_cursor + (uint64_t)m * ctx->mirror_offset;
+            for (uint32_t ci = 0; ci < num_chunks; ci++) {
+                uint64_t phys = phys_start + ci;
+                if (zinf_is_bad_sector(ctx, phys)) {
+                    any_degraded = 1u;
+                    continue;
+                }
+                if (ctx_write_sector(ctx, phys, &bulk_buffer[ci * ctx->sector_size]) != DRIVER_OK) {
+                    free(bulk_buffer);
+                    return STORAGE_ERR_DRIVER;
+                }
+                any_written = 1u;
             }
         }
         free(bulk_buffer);
@@ -199,7 +200,7 @@ uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint
             size_t chunk_len = (src_off + PAYLOAD_SIZE <= len)
                                ? PAYLOAD_SIZE : (len - src_off);
             memcpy(&sector_buf[1], &buffer[src_off], chunk_len);
-            uint32_t crc = crc32(sector_buf, HEADER_SIZE + PAYLOAD_SIZE);
+            uint32_t crc = zinf_crc32(sector_buf, HEADER_SIZE + PAYLOAD_SIZE);
             sector_buf[ctx->sector_size - 4] = (uint8_t)(crc & 0xFFu);
             sector_buf[ctx->sector_size - 3] = (uint8_t)((crc >> 8)  & 0xFFu);
             sector_buf[ctx->sector_size - 2] = (uint8_t)((crc >> 16) & 0xFFu);
@@ -207,15 +208,27 @@ uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint
 
             for (uint8_t m = 0; m < ctx->mirror_count; m++) {
                 uint64_t phys = cursor + (uint64_t)m * ctx->mirror_offset;
+                if (zinf_is_bad_sector(ctx, phys)) {
+                    any_degraded = 1u;
+                    continue;
+                }
                 if (ctx_write_sector(ctx, phys, sector_buf) != DRIVER_OK)
                     return STORAGE_ERR_DRIVER;
+                any_written = 1u;
             }
             cursor++;
         }
+
+        if (!any_written) return STORAGE_ERR_DRIVER;
         uint64_t new_last = cursor - 1u;
-        return log_set_last_sector(ctx, &new_last);
+        uint8_t  set_rc   = log_set_last_sector(ctx, &new_last);
+        if (set_rc != STORAGE_OK) return set_rc;
+        return any_degraded ? STORAGE_WARN_DEGRADED : STORAGE_OK;
     }
 
+    if (!any_written) return STORAGE_ERR_DRIVER;
     uint64_t new_last = base_write_cursor + num_chunks - 1u;
-    return log_set_last_sector(ctx, &new_last);
+    uint8_t  set_rc   = log_set_last_sector(ctx, &new_last);
+    if (set_rc != STORAGE_OK) return set_rc;
+    return any_degraded ? STORAGE_WARN_DEGRADED : STORAGE_OK;
 }

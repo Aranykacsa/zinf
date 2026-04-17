@@ -57,12 +57,17 @@ typedef struct zinf_ctx_t {
     uint64_t         mirror_offset;     /* sectors between mirror copies          */
     uint64_t         log_sector;        /* LBA of metadata sector (default 0)     */
     uint64_t         raid_offset;       /* runtime-computed mirror spacing        */
+    /* bad-sector blacklist — RAM only; rebuilt via zinf_scrub() at startup */
+    uint64_t         bad_sectors[MAX_BAD_SECTORS];
+    uint8_t          bad_sector_count;
 } zinf_ctx_t;
 
 extern zinf_ctx_t *zinf_ctx;  /* global pointer, set by platform file */
 ```
 
 There is no longer a global `config` struct or a `RAID_OFFSET` global. All runtime state lives in `zinf_ctx_t`.
+
+The `bad_sectors[]` array is **RAM-only** — it is not persisted to disk and is cleared on every `zinf_ctx_init_defaults()` call. Call `zinf_scrub()` once at startup to rebuild it from the actual storage state.
 
 ### `zinf_ctx_init_defaults`
 
@@ -92,6 +97,7 @@ zinf:
   mirror_count:     2     # default number of RAID copies
   header_size:      1     # reserved bytes at start of each sector
   metadata_sectors: 2     # sectors reserved for log metadata
+  max_bad_sectors:  16    # bad-sector blacklist capacity (1–255, default 16)
 
   data_types:
     - name: sensor_t
@@ -139,6 +145,7 @@ The LBA of the primary metadata sector. Changing this allows the metadata to liv
 #define STORAGE_ERR_DRIVER        2u
 #define STORAGE_ERR_LOG_FULL      3u
 #define STORAGE_ERR_UNRECOVERABLE 4u
+#define STORAGE_WARN_DEGRADED     5u  /* non-fatal: write succeeded with fewer mirrors */
 ```
 
 ### Driver (`driver.h`)
@@ -160,5 +167,6 @@ The LBA of the primary metadata sector. Changing this allows the metadata to liv
 | `PAYLOAD_SIZE` | `#define` | `config.h` | Compile time (derived) |
 | `RAID_MIRRORS` | `#define` | `config.h` | Compile time (from YAML) |
 | `MAX_MIRRORS` | `#define` | `config.h` | Compile time (fixed = 5) |
+| `MAX_BAD_SECTORS` | `#define` | `config.h` | Compile time (from YAML, default 16) |
 | `zinf_ctx_t` | struct | `config.h` | Runtime, per-instance |
 | `zinf_ctx` | `zinf_ctx_t *` | `platform_*.c` | Link time (platform file) |

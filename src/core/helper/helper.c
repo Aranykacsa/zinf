@@ -17,7 +17,7 @@ static void crc_table_init(void) {
     crc_table_ready = 1;
 }
 
-uint32_t crc32(const uint8_t *data, size_t len) {
+uint32_t zinf_crc32(const uint8_t *data, size_t len) {
     if (!crc_table_ready) crc_table_init();
 
     uint32_t crc = 0xFFFFFFFFu;

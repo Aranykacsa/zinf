@@ -3,6 +3,15 @@
 bin/
 obj/
 
+# Compiled binaries
+src/zinf_cli
+src/zinf
+tests/run_tests
+tests/run_fault_csv
+
+# Generated test outputs
+tests/fault_results.csv
+
 # Temporary output from decoder
 /src/.out/
 
@@ -10,5 +19,4 @@ obj/
 .DS_Store
 *.swp
 
-src/testdisk.img
 src/testdisk.img

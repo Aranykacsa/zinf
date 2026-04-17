@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* =========================
    Sector geometry
@@ -25,6 +26,9 @@
 
 /* Maximum supported mirror count — raid_read() candidates[] is sized for this */
 #define MAX_MIRRORS 5u
+
+/* Bad-sector blacklist capacity in zinf_ctx_t (from zinf.yaml max_bad_sectors) */
+#define MAX_BAD_SECTORS 16u
 
 /* =========================
    Metadata sector layout (format v3 — 64-bit LBA)
@@ -56,6 +60,8 @@
 #define STORAGE_ERR_DRIVER        2u
 #define STORAGE_ERR_LOG_FULL      3u
 #define STORAGE_ERR_UNRECOVERABLE 4u
+/* Non-fatal: write committed to >=1 mirror but fewer than mirror_count */
+#define STORAGE_WARN_DEGRADED     5u
 
 /* Driver return codes */
 #define DRIVER_OK        0
@@ -84,6 +90,9 @@ typedef struct zinf_ctx_t {
     uint64_t         mirror_offset;    /* sectors between mirror copies          */
     uint64_t         log_sector;       /* LBA of metadata sector (default 0)     */
     uint64_t         raid_offset;      /* runtime-computed mirror spacing        */
+    /* bad-sector blacklist — RAM only; rebuilt via zinf_scrub() at startup */
+    uint64_t         bad_sectors[MAX_BAD_SECTORS];
+    uint8_t          bad_sector_count;
 } zinf_ctx_t;
 
 /* Default global instance (set by platform file) */
@@ -92,3 +101,23 @@ extern zinf_ctx_t *zinf_ctx;
 /* Initialise *ctx from compile-time defaults.
    Caller must set ctx->driver before calling this. */
 void zinf_ctx_init_defaults(zinf_ctx_t *ctx);
+
+/* =========================
+   Bad-sector blacklist helpers (static inline — available everywhere config.h is included)
+   ========================= */
+static inline bool zinf_is_bad_sector(const zinf_ctx_t *ctx, uint64_t lba) {
+    for (uint8_t _i = 0; _i < ctx->bad_sector_count; _i++)
+        if (ctx->bad_sectors[_i] == lba) return true;
+    return false;
+}
+
+static inline uint8_t zinf_mark_bad_sector(zinf_ctx_t *ctx, uint64_t lba) {
+    if (zinf_is_bad_sector(ctx, lba))             return STORAGE_OK;
+    if (ctx->bad_sector_count >= MAX_BAD_SECTORS) return STORAGE_ERR_PARAM;
+    ctx->bad_sectors[ctx->bad_sector_count++] = lba;
+    return STORAGE_OK;
+}
+
+static inline void zinf_clear_bad_sectors(zinf_ctx_t *ctx) {
+    ctx->bad_sector_count = 0u;
+}

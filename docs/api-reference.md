@@ -16,7 +16,8 @@ All storage API functions take a `zinf_ctx_t *ctx` as their first argument. This
 | `STORAGE_ERR_PARAM` | `1` | Invalid parameter (e.g. NULL pointer) |
 | `STORAGE_ERR_DRIVER` | `2` | Driver initialization or I/O failure |
 | `STORAGE_ERR_LOG_FULL` | `3` | Message log capacity exhausted |
-| `STORAGE_ERR_UNRECOVERABLE` | `4` | All mirrors disagree; data cannot be recovered |
+| `STORAGE_ERR_UNRECOVERABLE` | `4` | All mirrors failed CRC; data cannot be recovered |
+| `STORAGE_WARN_DEGRADED` | `5` | **Non-fatal.** Write succeeded on ≥1 mirror but fewer than `mirror_count` (some mirrors were blacklisted). The write committed; caller may want to call `zinf_recover_sector()`. |
 
 ### Driver Return Codes (`driver.h`)
 
@@ -222,10 +223,10 @@ Internal: persist the last-written sector LBA to the next copy slot in round-rob
 
 ## Helper (`core/helper/helper.h`)
 
-### `crc32`
+### `zinf_crc32`
 
 ```c
-uint32_t crc32(const uint8_t *data, size_t len);
+uint32_t zinf_crc32(const uint8_t *data, size_t len);
 ```
 
 Compute a CRC32 checksum using the standard Ethernet/ZIP polynomial (`0xEDB88320`).
@@ -238,6 +239,8 @@ Compute a CRC32 checksum using the standard Ethernet/ZIP polynomial (`0xEDB88320
 **Returns:** 32-bit CRC value.
 
 **Algorithm:** 256-entry lookup table (O(n)). Initialised lazily on first call. Initial CRC = `0xFFFFFFFF`, final CRC inverted (`~crc`).
+
+> **Note:** Named `zinf_crc32` (not `crc32`) to avoid a symbol collision with the identically-named zlib function, which is pulled in transitively by libxlsxwriter → libminizip.
 
 ---
 
@@ -259,4 +262,129 @@ ctx->mirror_count     = min(RAID_MIRRORS, MAX_MIRRORS);
 ctx->metadata_sectors = <yaml value>;
 ctx->log_sector       = 0;
 ctx->mirror_offset    = ctx->raid_offset;  // use previously set raid_offset
+ctx->bad_sector_count = 0;                 // blacklist starts empty
+```
+
+---
+
+## Fault Detection and Recovery (`core/api/api.h`)
+
+All recovery functions are **explicitly called** — nothing fires automatically.
+
+### Mirror status codes
+
+Used in `zinf_sector_health_t.status[]`:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `ZINF_MIRROR_OK` | `0` | CRC verified |
+| `ZINF_MIRROR_IO_ERR` | `1` | `read_sector` failed |
+| `ZINF_MIRROR_CRC_FAIL` | `2` | CRC mismatch |
+| `ZINF_MIRROR_BLACKLIST` | `3` | LBA is in the bad-sector list — skipped |
+
+### `zinf_sector_health_t`
+
+```c
+typedef struct {
+    uint8_t status[MAX_MIRRORS]; /* per-mirror status (ZINF_MIRROR_*) */
+    uint8_t valid_count;         /* mirrors with status == ZINF_MIRROR_OK */
+} zinf_sector_health_t;
+```
+
+### `zinf_scrub_report_t`
+
+```c
+typedef struct {
+    uint32_t checked;       /* logical sectors examined */
+    uint32_t healthy;       /* all mirrors OK, no repair needed */
+    uint32_t repaired;      /* >=1 mirror was repaired successfully */
+    uint32_t unrecoverable; /* no valid mirror found */
+} zinf_scrub_report_t;
+```
+
+---
+
+### Bad-sector blacklist helpers (`config.h` — static inline)
+
+These are generated into `config.h` and are available wherever `config.h` is included. They operate only on `zinf_ctx_t` fields and never do I/O.
+
+```c
+bool    zinf_is_bad_sector(const zinf_ctx_t *ctx, uint64_t lba);
+uint8_t zinf_mark_bad_sector(zinf_ctx_t *ctx, uint64_t lba);
+void    zinf_clear_bad_sectors(zinf_ctx_t *ctx);
+```
+
+| Function | Returns | Notes |
+|---|---|---|
+| `zinf_is_bad_sector` | `true`/`false` | Linear scan of `bad_sectors[]` |
+| `zinf_mark_bad_sector` | `STORAGE_OK` or `STORAGE_ERR_PARAM` | `STORAGE_OK` if already listed (idempotent); `STORAGE_ERR_PARAM` if list is full |
+| `zinf_clear_bad_sectors` | `void` | Resets `bad_sector_count` to 0 |
+
+The list capacity is `MAX_BAD_SECTORS` (from `zinf.yaml`; default 16, 128 bytes on embedded targets).
+
+---
+
+### `zinf_check_sector`
+
+```c
+uint8_t zinf_check_sector(zinf_ctx_t *ctx, uint64_t logical_sector,
+                           zinf_sector_health_t *out);
+```
+
+Read all mirrors for `logical_sector` and verify CRC on each. Fills `*out` with per-mirror status and `valid_count`. **Pure read — no writes, no blacklist mutations, no side effects.**
+
+| Parameter | Description |
+|---|---|
+| `ctx` | Runtime context |
+| `logical_sector` | Logical sector index (same space as `raid_read`) |
+| `out` | Output health snapshot (must not be NULL) |
+
+**Returns:** `STORAGE_ERR_PARAM` if `ctx` or `out` is NULL; `STORAGE_OK` otherwise (per-mirror errors are encoded in `out->status[]`).
+
+---
+
+### `zinf_recover_sector`
+
+```c
+uint8_t zinf_recover_sector(zinf_ctx_t *ctx, uint64_t logical_sector);
+```
+
+Repair bad mirrors by copying from the best valid mirror. For each mirror that fails CRC or I/O:
+
+1. Write the good copy to that physical LBA.
+2. Re-read and re-verify CRC.
+3. If re-verify fails → `zinf_mark_bad_sector(ctx, physical_lba)`.
+
+If no valid mirror exists at all, all non-blacklisted physical LBAs are blacklisted and `STORAGE_ERR_UNRECOVERABLE` is returned.
+
+**Returns:** `STORAGE_OK` (≥1 mirror valid, repair may be partial), `STORAGE_ERR_UNRECOVERABLE`, or `STORAGE_ERR_PARAM`.
+
+---
+
+### `zinf_scrub`
+
+```c
+uint8_t zinf_scrub(zinf_ctx_t *ctx, uint64_t start, uint64_t end,
+                   zinf_scrub_report_t *report);
+```
+
+Iterate logical sectors `[start..end]` inclusive. For each sector: run `zinf_check_sector`; if not fully healthy, call `zinf_recover_sector`. Accumulate results in `*report` (may be NULL to discard). **Never stops early** — unrecoverable sectors are counted and processing continues.
+
+| Parameter | Description |
+|---|---|
+| `ctx` | Runtime context |
+| `start` | First logical sector to check (inclusive) |
+| `end` | Last logical sector to check (inclusive) |
+| `report` | Output statistics (NULL = discard) |
+
+**Returns:** `STORAGE_ERR_PARAM` if `ctx` is NULL; `STORAGE_OK` otherwise.
+
+**Typical startup pattern:**
+
+```c
+// After driver init and zinf_ctx_init_defaults():
+zinf_scrub_report_t report;
+zinf_scrub(ctx, 1u, last_written_sector, &report);
+// report.unrecoverable > 0 → some data is permanently lost
+// Blacklist is now populated for future writes
 ```
