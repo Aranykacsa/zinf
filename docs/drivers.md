@@ -176,18 +176,63 @@ SDHC/SDXC cards use block addresses. SD (v1) cards use byte addresses. The drive
 ### Global Instance
 
 ```c
-driver_t sd_driver;  // initialized by sd_driver_init()
+extern driver_t sd_driver;
 ```
 
-### `sd_driver_init`
+### `sd_driver_init_spi`
 
 ```c
-int sd_driver_init(driver_t *drv, const sd_spi_ops_t *ops);
+void sd_driver_init_spi(spi_handle_t handle, const sd_spi_ops_t *ops);
 ```
 
-Initialize the driver with platform SPI callbacks. Runs the SD initialization sequence (CMD0 → CMD8 → ACMD41 → CMD58) and fills `drv->total_sectors`.
+Call once before `ctx->driver->init()` to bind the platform SPI handle and callbacks. After this, call `ctx->driver->init(ctx->driver)` to run the SD initialization sequence (CMD0 → CMD8 → ACMD41 → CMD58).
 
-**Returns:** `DRIVER_OK` or `DRIVER_ERR_INIT`
+| Parameter | Notes |
+|---|---|
+| `handle` | Opaque pointer passed back into every callback — typically an MCU SPI peripheral handle. May be `NULL` if your callbacks do not need it. |
+| `ops` | `cs_set` and `xfer` are required. `tx_buf` and `rx_buf` may be `NULL`; the driver falls back to repeated `xfer()` calls. |
+
+`init()` populates `sd_driver.sector_size` (512) and leaves `total_sectors` at 0 — the SD protocol requires a separate CSD read for exact capacity, which is not yet implemented. Set `mirror_offset` from your known card size or from the value reported by `BLKGETSIZE64` on the host.
+
+**RP2350 / Pico SDK example:**
+
+```c
+static void my_cs_set(spi_handle_t h, int active) {
+    (void)h;
+    gpio_put(SD_PIN_CS, active ? 0 : 1);
+}
+
+static uint8_t my_xfer(spi_handle_t h, uint8_t tx) {
+    (void)h;
+    uint8_t rx = 0;
+    spi_write_read_blocking(spi0, &tx, &rx, 1);
+    return rx;
+}
+
+static void my_tx_buf(spi_handle_t h, const uint8_t *buf, size_t len) {
+    (void)h;
+    spi_write_blocking(spi0, buf, len);
+}
+
+static void my_rx_buf(spi_handle_t h, uint8_t *buf, size_t len) {
+    (void)h;
+    spi_read_blocking(spi0, 0xFF, buf, len);
+}
+
+static const sd_spi_ops_t my_ops = {
+    .cs_set  = my_cs_set,
+    .xfer    = my_xfer,
+    .tx_buf  = my_tx_buf,
+    .rx_buf  = my_rx_buf,
+};
+
+/* In your init sequence: */
+sd_driver_init_spi(NULL, &my_ops);
+zinf_ctx->driver = &sd_driver;
+zinf_ctx->driver->init(zinf_ctx->driver);
+```
+
+See [Embedded Porting Guide](embedded-porting.md) for the complete RP2350 wiring and first-boot initialization pattern.
 
 ---
 
@@ -196,12 +241,13 @@ Initialize the driver with platform SPI callbacks. Runs the SD initialization se
 To port ZINF to a new platform:
 
 1. Create `drivers/<target>/<target>_driver.c`.
+   `drivers/embedded/embedded_driver.c` is a compilable stub — all functions return errors but the file structure, `driver_t` initializer, and function signatures are correct. Copy it as a starting point and replace the function bodies.
 2. Define a private context struct for your hardware state.
 3. Implement `init`: open/initialize the storage peripheral, fill `total_sectors` and `total_size_bytes`.
 4. Implement `read_block` and `write_block`: read/write exactly `sector_size` bytes at the given 64-bit LBA.
 5. Optionally implement `read_blocks`/`write_blocks` for DMA or burst transfers.
 6. Create `platform/platform_<target>.c` that sets `zinf_ctx->driver = &<target>_driver`.
-7. Update the Makefile to compile your new files instead of the Linux ones.
+7. Update the Makefile (or CMakeLists.txt) to compile your new files instead of the Linux ones.
 
 The rest of the ZINF codebase (API, storage engine, CRC) requires no changes.
 

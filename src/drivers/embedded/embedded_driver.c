@@ -1,15 +1,16 @@
 #include "driver.h"
 #include <stdint.h>
+#include <stddef.h>
 
 static int emb_init(driver_t *self) { (void)self; return DRIVER_ERR_INIT; }
 static void emb_deinit(driver_t *self) { (void)self; }
 
-static int emb_read(driver_t *self, uint32_t lba, uint8_t *buf) {
+static int emb_read(driver_t *self, uint64_t lba, uint8_t *buf) {
     (void)self; (void)lba; (void)buf;
     return DRIVER_ERR_IO;
 }
 
-static int emb_write(driver_t *self, uint32_t lba, const uint8_t *buf) {
+static int emb_write(driver_t *self, uint64_t lba, const uint8_t *buf) {
     (void)self; (void)lba; (void)buf;
     return DRIVER_ERR_IO;
 }

@@ -27,8 +27,9 @@ static int ctx_write_sector(zinf_ctx_t *ctx, uint64_t lba, const uint8_t *buf) {
 
 /* -----------------------------------------------------------------------
    Metadata: last-sector pointer with 3 redundant copies + versioning
-   Layout of sector ctx->log_sector (format v3 — 64-bit LBA):
-     Copy i (i = 0..META_COPIES-1) starts at byte i*META_COPY_STRIDE:
+   Layout of sector ctx->log_sector (format v4 — magic prefix + 64-bit LBA):
+     [0..7]   Magic header: 'Z','I','N','F', version_lo, version_hi, 0x00, 0x00
+     Copy i (i = 0..META_COPIES-1) starts at byte META_COPY_SLOT_BASE + i*META_COPY_STRIDE:
        [+0..+7] last_sector (uint64 LE)
        [+8..+9] version     (uint16 LE, monotonic)
      [META_WRITE_POS_OFF..+1]  write_pos (uint16 LE)
@@ -50,7 +51,7 @@ uint8_t log_get_last_sector(zinf_ctx_t *ctx, uint64_t *last_sector) {
     uint64_t best_val = 0;
 
     for (uint8_t i = 0; i < META_COPIES; i++) {
-        uint16_t off = (uint16_t)(i * META_COPY_STRIDE);
+        uint16_t off = (uint16_t)(META_COPY_SLOT_BASE + i * META_COPY_STRIDE);
         uint64_t val = (uint64_t)buf[off]
                      | ((uint64_t)buf[off + 1] << 8)
                      | ((uint64_t)buf[off + 2] << 16)
@@ -85,7 +86,7 @@ uint8_t log_set_last_sector(zinf_ctx_t *ctx, const uint64_t *last_sector) {
     uint8_t  max_slot = 0;
 
     for (uint8_t i = 0; i < META_COPIES; i++) {
-        uint16_t off = (uint16_t)(i * META_COPY_STRIDE);
+        uint16_t off = (uint16_t)(META_COPY_SLOT_BASE + i * META_COPY_STRIDE);
         uint16_t ver = (uint16_t)buf[off + 8]
                      | ((uint16_t)buf[off + 9] << 8);
         if (i == 0 || (uint16_t)(ver - max_ver) < 0x8000u) {
@@ -97,7 +98,7 @@ uint8_t log_set_last_sector(zinf_ctx_t *ctx, const uint64_t *last_sector) {
     /* Write to the NEXT slot (round-robin) with version = max+1. */
     uint8_t  next_slot = (uint8_t)((max_slot + 1u) % META_COPIES);
     uint16_t next_ver  = (uint16_t)(max_ver + 1u);
-    uint16_t off       = (uint16_t)(next_slot * META_COPY_STRIDE);
+    uint16_t off       = (uint16_t)(META_COPY_SLOT_BASE + next_slot * META_COPY_STRIDE);
 
     buf[off]     = (uint8_t)(*last_sector & 0xFFu);
     buf[off + 1] = (uint8_t)((*last_sector >> 8)  & 0xFFu);
@@ -117,12 +118,23 @@ uint8_t log_set_last_sector(zinf_ctx_t *ctx, const uint64_t *last_sector) {
 
 uint8_t log_init_log_sector(zinf_ctx_t *ctx) {
     uint8_t buf[SECTOR_SIZE];
-    memset(buf, 0, sizeof(buf));
-
     uint8_t meta_sects = (ctx->metadata_sectors > 0) ? ctx->metadata_sectors : 2u;
 
-    /* Zero all reserved metadata sectors */
-    for (uint8_t s = 0; s < meta_sects; s++) {
+    /* Write primary metadata sector (sector 0) with format v4 magic header */
+    memset(buf, 0, sizeof(buf));
+    buf[0] = META_MAGIC_B0;
+    buf[1] = META_MAGIC_B1;
+    buf[2] = META_MAGIC_B2;
+    buf[3] = META_MAGIC_B3;
+    buf[4] = (uint8_t)(META_FORMAT_VER & 0xFFu);
+    buf[5] = (uint8_t)((META_FORMAT_VER >> 8) & 0xFFu);
+    /* bytes 6-7: reserved, already zero */
+    if (ctx_write_sector(ctx, ctx->log_sector, buf) != DRIVER_OK)
+        return STORAGE_ERR_DRIVER;
+
+    /* Zero any additional metadata sectors (sector 1+) */
+    memset(buf, 0, sizeof(buf));
+    for (uint8_t s = 1; s < meta_sects; s++) {
         if (ctx_write_sector(ctx, ctx->log_sector + s, buf) != DRIVER_OK)
             return STORAGE_ERR_DRIVER;
     }

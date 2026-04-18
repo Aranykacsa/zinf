@@ -97,9 +97,6 @@ static int linux_init(driver_t *self)
         self->total_sectors = 0;
     }
 
-    fprintf(stderr, "[linux_driver] RAW open %s (fd=%d, sectors=%llu)\n",
-            ctx->path, ctx->fd, (unsigned long long)self->total_sectors);
-
     return DRIVER_OK;
 }
 

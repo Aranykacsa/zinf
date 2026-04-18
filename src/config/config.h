@@ -31,26 +31,36 @@
 #define MAX_BAD_SECTORS 16u
 
 /* =========================
-   Metadata sector layout (format v3 — 64-bit LBA)
+   Metadata sector layout (format v4 — magic prefix + 64-bit LBA)
    ---------------------------------
-   Each of META_COPIES copy-slots holds:
+   [0..3]    Magic bytes: 'Z' 'I' 'N' 'F'  (0x5A 0x49 0x4E 0x46)
+   [4..5]    Format version: 4 (uint16 LE)
+   [6..7]    Reserved (0x00 0x00)
+   Each of META_COPIES copy-slots holds (starting at byte META_COPY_SLOT_BASE):
      [+0..+7]  last_sector (64-bit LE)
      [+8..+9]  version     (16-bit LE, monotonic)
    Followed by:
-     [30..31]  write_pos   (16-bit LE)
-     [32]      flags       (1 byte)
-     [33..511] message log payload
+     [38..39]  write_pos   (16-bit LE)
+     [40]      flags       (1 byte)
+     [41..511] message log payload
    ========================= */
-#define META_COPY_STRIDE    10u                              /* bytes per copy slot */
-#define META_COPIES          3u                              /* redundant copies    */
-#define META_WRITE_POS_OFF  (META_COPIES * META_COPY_STRIDE) /* = 30               */
-#define META_FLAGS_OFF      (META_WRITE_POS_OFF + 2u)        /* = 32               */
-#define META_HDR_SIZE       (META_FLAGS_OFF + 1u)            /* = 33               */
+#define META_MAGIC_B0       0x5Au  /* 'Z' */
+#define META_MAGIC_B1       0x49u  /* 'I' */
+#define META_MAGIC_B2       0x4Eu  /* 'N' */
+#define META_MAGIC_B3       0x46u  /* 'F' */
+#define META_FORMAT_VER     4u
+#define META_MAGIC_SIZE     8u     /* 4 magic + 2 version + 2 reserved */
+#define META_COPY_SLOT_BASE META_MAGIC_SIZE                            /* = 8  */
+#define META_COPY_STRIDE    10u                                        /* bytes per copy slot */
+#define META_COPIES          3u                                        /* redundant copies    */
+#define META_WRITE_POS_OFF  (META_COPY_SLOT_BASE + META_COPIES * META_COPY_STRIDE) /* = 38 */
+#define META_FLAGS_OFF      (META_WRITE_POS_OFF + 2u)                              /* = 40 */
+#define META_HDR_SIZE       (META_FLAGS_OFF + 1u)                                  /* = 41 */
 
 /* Message log capacity */
-#define MSG_LOG_CAP_S0      (SECTOR_SIZE - META_HDR_SIZE)           /* 479 bytes  */
+#define MSG_LOG_CAP_S0      (SECTOR_SIZE - META_HDR_SIZE)           /* 471 bytes  */
 #define MSG_LOG_CAP_S1      SECTOR_SIZE                              /* 512 bytes  */
-#define MSG_LOG_TOTAL_CAP   (MSG_LOG_CAP_S0 + MSG_LOG_CAP_S1)       /* 991 bytes  */
+#define MSG_LOG_TOTAL_CAP   (MSG_LOG_CAP_S0 + MSG_LOG_CAP_S1)       /* 983 bytes  */
 
 /* =========================
    Storage return codes

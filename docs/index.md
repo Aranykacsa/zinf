@@ -14,13 +14,14 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 
 | Document | Description |
 |---|---|
-| [Getting Started](getting-started.md) | Build, loopback device setup, and first run |
+| [Getting Started](getting-started.md) | Build, install, format a device, and first run |
 | [Architecture](architecture.md) | Layer design, RAID layout, and data flows |
 | [API Reference](api-reference.md) | All public functions with signatures and return codes |
 | [Data Formats](data-formats.md) | Sector, metadata, and sensor wire layouts |
 | [Drivers](drivers.md) | `driver_t` interface and platform implementations |
 | [Configuration](configuration.md) | Constants, structs, and runtime settings |
 | [Benchmarking](benchmarking.md) | Running the benchmark and interpreting results |
+| [Embedded Porting Guide](embedded-porting.md) | SPI wiring, CMakeLists.txt, and first-boot init for RP2350/Pico |
 
 ## Repository Layout
 
@@ -45,18 +46,18 @@ zinf/
 ## Quick Start
 
 ```bash
-# Build
-cd src && make
+# Build and install
+make && sudo make install
 
-# Create a 5 MB test image and attach it
-dd if=/dev/zero of=testdisk.img bs=512 count=10240
-sudo losetup --find --show testdisk.img   # usually /dev/loop0
+# Format a test image
+dd if=/dev/zero of=test.img bs=1M count=8 status=none
+zinf format test.img
 
-# Run interactive CLI
-sudo ./zinf_cli cli
+# Interactive shell
+sudo zinf shell /dev/loop0
 
-# Run benchmarks
-sudo ./zinf_cli bench
+# Benchmark
+sudo zinf bench /dev/loop0
 ```
 
 See [Getting Started](getting-started.md) for the full walkthrough.

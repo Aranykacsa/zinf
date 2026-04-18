@@ -3,14 +3,11 @@
 ## Running the Benchmark
 
 ```bash
-# Ensure a loopback device is attached
-sudo losetup --find --show testdisk.img
-
 # Run (outputs CSV to stdout)
-sudo ./zinf_cli bench
+sudo zinf bench /dev/sdb
 
 # Save results
-sudo ./zinf_cli bench > results.csv
+sudo zinf bench /dev/sdb > results.csv
 ```
 
 The benchmark automatically:

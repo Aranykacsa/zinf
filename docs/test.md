@@ -9,6 +9,8 @@ make -B run
 
 Runs **28 tests** across three suites — no loop device, no sudo needed. Two image files are created and cleaned up automatically under `/var/tmp/`. For the larger CSV-driven integration suite see [Section 2](#2-csv-fault-injection-test-suite-no-hardware-needed).
 
+> **All test suites (`make run`, `make csv`) are host-only** — they use the Linux block driver and, for the CSV suite, `libxlsxwriter`. Neither can run on an MCU. See the [Embedded Porting Guide](embedded-porting.md#testing-on-mcu) for MCU testing strategy.
+
 | Suite | File | Count | Covers |
 |---|---|---|---|
 | CRC | `test_crc.c` | 5 | `zinf_crc32()` correctness and bit sensitivity |
@@ -69,7 +71,7 @@ sudo losetup /dev/loop0 /tmp/test.img
 
 cd src
 make
-sudo ./zinf_cli cli
+sudo zinf shell /dev/loop0
 ```
 
 Then type commands:
@@ -88,7 +90,7 @@ Then type commands:
 ## 5. Benchmark
 
 ```bash
-sudo ./zinf_cli bench
+sudo zinf bench /dev/loop0
 ```
 
 Outputs a CSV of throughput and latency across different chunk sizes.
@@ -98,7 +100,7 @@ Outputs a CSV of throughput and latency across different chunk sizes.
 ## 6. Image inspection (no sudo)
 
 ```bash
-./zinf_cli read /tmp/test.img
+zinf info /tmp/test.img
 ```
 
 Shows sector geometry and computed RAID offset for any image file.

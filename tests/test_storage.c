@@ -223,7 +223,7 @@ static void test_metadata_version_wraparound(void) {
     memset(meta, 0, sizeof(meta));
     uint64_t fake_last = 42u;
     for (uint8_t slot = 0; slot < META_COPIES; slot++) {
-        uint16_t off = (uint16_t)(slot * META_COPY_STRIDE);
+        uint16_t off = (uint16_t)(META_COPY_SLOT_BASE + slot * META_COPY_STRIDE);
         /* last_sector = 42 LE */
         for (int b = 0; b < 8; b++)
             meta[off + b] = (uint8_t)((fake_last >> (b * 8)) & 0xFFu);

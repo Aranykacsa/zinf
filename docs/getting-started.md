@@ -1,161 +1,149 @@
 # Getting Started
 
-## Prerequisites
-
-| Requirement | Notes |
-|---|---|
-| GCC (C11) | `gcc --version` should report 5.0+ |
-| GNU Make | `make --version` |
-| Linux kernel | Loopback device support (`CONFIG_BLK_DEV_LOOP`) |
-| `dd` | Standard coreutils — for image creation and wipe |
-| `sudo` | Required for `/dev/loop0` access and `O_DIRECT` raw I/O |
-
-## Build
+## Install
 
 ```bash
-cd zinf/src
-make          # produces ./zinf_cli
-make clean    # remove build artifacts
+git clone <repo-url>
+cd zinf
+make
+sudo make install
 ```
 
-The Makefile compiles all sources with:
+Installs `zinf` and `zinf-probe` to `/usr/local/bin` and registers the udev rule so ZINF-formatted SD cards are automatically detected when inserted.
 
-```
--std=c11 -O2 -Wall -Wextra -Wpedantic -Wshadow -Wundef
-```
+**Prerequisites:** GCC (C11), GNU Make, Linux.
 
-## Create a Test Loopback Device
+---
 
-ZINF targets `/dev/loop0` by default. The easiest way to test without real hardware is a loopback image.
+## Format a Device
 
 ```bash
-# Create a 5 MB image (10240 sectors × 512 bytes)
-dd if=/dev/zero of=testdisk.img bs=512 count=10240
+# SD card or USB drive
+sudo zinf format /dev/sdb
 
-# Attach it as a loopback device
-sudo losetup --find --show testdisk.img
-# Output: /dev/loop0
-
-# Verify
-sudo losetup -l
+# Image file (useful for testing without hardware)
+dd if=/dev/zero of=experiment.img bs=1M count=4
+zinf format experiment.img
 ```
 
-To detach when done:
+Both commands initialize ZINF metadata (magic header + RAID layout) in a single step.
+
+---
+
+## Inspect a Device
 
 ```bash
-sudo losetup -d /dev/loop0
+zinf info /dev/sdb
 ```
 
-> The image file is stored at `src/testdisk.img` by convention, but any path works as long as you attach it as `/dev/loop0`.
+Output:
 
-## Running the CLI
+```
+Image          : /dev/sdb
+Sector size    : 512
+Payload size   : 507
+Mirrors        : 2
+Total sectors  : 7744512
+Usable sectors : 7744510
+RAID offset    : 3872255
+```
+
+---
+
+## Detect ZINF Devices
+
+After `sudo make install`, inserting a ZINF-formatted SD card fires the udev rule automatically — no manual trigger needed.
 
 ```bash
-sudo ./zinf_cli <mode>
+# Read udev properties (works out of the box after install)
+udevadm info /dev/sdb | grep ID_FS
+# → ID_FS_TYPE=zinf
+# → ID_FS_VERSION=4
+
+# lsblk with udev properties
+lsblk --properties-by file,udev -f /dev/sdb
+# → NAME  FSTYPE  FSVER ...
+# → sdb   zinf    4
 ```
 
-### Available Modes
-
-| Mode | Description |
-|---|---|
-| `bench` | Run throughput/latency benchmark, print CSV |
-| `cli` | Start interactive command prompt |
-| `read <img>` | Print geometry info for an image file |
-| `help` | Show usage |
-
-### Interactive CLI
-
-```
-$ sudo ./zinf_cli cli
-zinf> help
-  help
-  cfg show
-  storage init
-  log init
-  msg save <0-255>
-  msg test
-  raid sensor <count> <v0> <v1> ...
-
-zinf> storage init
-zinf> log init
-zinf> msg save 42
-zinf> msg test
-zinf> raid sensor 2 25.0 60.0 26.5 58.0
-```
-
-### One-Shot Command
-
-You can pass CLI commands directly as arguments (no interactive prompt):
+For standard `lsblk -f` and `blkid` recognition (patches the system libblkid — takes ~1 min, requires internet):
 
 ```bash
-sudo ./zinf_cli storage init
-sudo ./zinf_cli log init
-sudo ./zinf_cli msg save 255
+sudo make install-blkid
+# then:
+lsblk -f /dev/sdb        # → FSTYPE=zinf
+blkid /dev/sdb           # → TYPE="zinf"
 ```
 
-### Read Image Info
+---
+
+## Write Data
+
+One-shot sensor write:
 
 ```bash
-sudo ./zinf_cli read testdisk.img
+sudo zinf -d /dev/sdb raid sensor 1 23.5 65.0
 ```
 
-Output example:
+Interactive shell:
 
+```bash
+sudo zinf shell /dev/sdb
+> help
+> raid sensor 2 23.5 65.0 24.1 62.3
+> msg save 42
+> msg test
+> cfg show
 ```
-Image:          testdisk.img
-Sector size:    512 bytes
-Payload size:   507 bytes
-Mirror count:   2
-Total sectors:  10240
-Usable sectors: 10238
-RAID offset:    5119
-```
+
+---
 
 ## Benchmark
 
 ```bash
-sudo ./zinf_cli bench
+sudo zinf bench /dev/sdb > results.csv
 ```
 
-Outputs CSV to stdout:
+Outputs a CSV with throughput and latency columns for a range of payload sizes.
+See [Benchmarking](benchmarking.md) for details.
 
-```
-PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten
-507,1823.4,312,87,985
-1014,3241.1,289,63,985
-...
-```
+---
 
-Redirect to a file for later analysis:
+## Embedded (RP2350 / Pico)
+
+A card formatted with `zinf format` can be inserted directly into the MCU — the on-disk layout is identical. See [Embedded Porting Guide](embedded-porting.md) for SPI wiring, CMakeLists.txt, and first-boot initialization code.
+
+---
+
+## Uninstall
 
 ```bash
-sudo ./zinf_cli bench > results.csv
+sudo make uninstall
 ```
 
-See [Benchmarking](benchmarking.md) for details on metrics and interpretation.
+---
 
-## Full Example Session
+## Full Example (loopback test without hardware)
 
 ```bash
 # Build
-cd zinf/src && make
+make
 
-# Set up loopback device
-dd if=/dev/zero of=testdisk.img bs=512 count=10240
-sudo losetup --find --show testdisk.img
+# Create and format a test image
+dd if=/dev/zero of=test.img bs=1M count=8 status=none
+./src/zinf format test.img
 
-# Initialize storage
-sudo ./zinf_cli storage init
-sudo ./zinf_cli log init
+# Confirm ZINF magic
+od -A x -t x1 test.img | head -1
+# → 000000 5a 49 4e 46 04 00 ...
 
-# Write some data
-sudo ./zinf_cli msg save 100
-sudo ./zinf_cli msg test         # writes 1024 bytes
-sudo ./zinf_cli raid sensor 1 23.5 65.0
-
-# Benchmark
-sudo ./zinf_cli bench > bench.csv
+# Attach as loop device and verify detection
+sudo losetup -f --show test.img     # → /dev/loopN
+sudo udevadm trigger --action=add /dev/loopN && sudo udevadm settle
+udevadm info /dev/loopN | grep ID_FS
+# → ID_FS_TYPE=zinf
+# → ID_FS_VERSION=4
 
 # Cleanup
-sudo losetup -d /dev/loop0
+sudo losetup -d /dev/loopN
 ```

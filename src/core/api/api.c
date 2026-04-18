@@ -31,7 +31,6 @@ int write_sector(zinf_ctx_t *ctx, uint64_t sector, const uint8_t *buffer) {
 uint8_t setup_storage(zinf_ctx_t *ctx) {
     zinf_ctx_init_defaults(ctx);
     int rc = ctx->driver->init(ctx->driver);
-    printf("[STORAGE] init: %d\r\n", rc);
     return (rc == DRIVER_OK) ? STORAGE_OK : STORAGE_ERR_DRIVER;
 }
 

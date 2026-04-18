@@ -119,13 +119,16 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
     metadata_sectors = cfg["metadata_sectors"]
     max_bad_sectors  = cfg["max_bad_sectors"]
 
-    # Derived metadata constants (format v3 — 64-bit LBA per copy slot)
-    meta_copy_stride   = 10   # 8 bytes LBA + 2 bytes version
-    meta_copies        = 3
-    meta_write_pos_off = meta_copies * meta_copy_stride   # 30
-    meta_flags_off     = meta_write_pos_off + 2           # 32
-    meta_hdr_size      = meta_flags_off + 1               # 33
-    msg_log_cap_s0     = sector_size - meta_hdr_size
+    # Derived metadata constants (format v4 — 8-byte magic prefix + 64-bit LBA per copy slot)
+    meta_format_ver     = 4
+    meta_magic_size     = 8   # 4 magic + 2 version + 2 reserved
+    meta_copy_slot_base = meta_magic_size                                    # = 8
+    meta_copy_stride    = 10  # 8 bytes LBA + 2 bytes version
+    meta_copies         = 3
+    meta_write_pos_off  = meta_copy_slot_base + meta_copies * meta_copy_stride   # 38
+    meta_flags_off      = meta_write_pos_off + 2                                  # 40
+    meta_hdr_size       = meta_flags_off + 1                                      # 41
+    msg_log_cap_s0      = sector_size - meta_hdr_size
     msg_log_cap_s1     = sector_size
     msg_log_total_cap  = msg_log_cap_s0 + msg_log_cap_s1
 
@@ -163,9 +166,12 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         f"#define MAX_BAD_SECTORS {max_bad_sectors}u",
         "",
         "/* =========================",
-        "   Metadata sector layout (format v3 — 64-bit LBA)",
+        "   Metadata sector layout (format v4 — magic prefix + 64-bit LBA)",
         "   ---------------------------------",
-        "   Each of META_COPIES copy-slots holds:",
+        "   [0..3]    Magic bytes: 'Z' 'I' 'N' 'F'  (0x5A 0x49 0x4E 0x46)",
+        "   [4..5]    Format version: 4 (uint16 LE)",
+        "   [6..7]    Reserved (0x00 0x00)",
+        "   Each of META_COPIES copy-slots holds (starting at byte META_COPY_SLOT_BASE):",
         "     [+0..+7]  last_sector (64-bit LE)",
         "     [+8..+9]  version     (16-bit LE, monotonic)",
         "   Followed by:",
@@ -173,11 +179,18 @@ def gen_config_h(cfg: dict, out_path: str) -> None:
         f"     [{meta_flags_off}]      flags       (1 byte)",
         f"     [{meta_hdr_size}..{sector_size-1}] message log payload",
         "   ========================= */",
-        f"#define META_COPY_STRIDE    {meta_copy_stride}u                              /* bytes per copy slot */",
-        f"#define META_COPIES          {meta_copies}u                              /* redundant copies    */",
-        f"#define META_WRITE_POS_OFF  (META_COPIES * META_COPY_STRIDE) /* = {meta_write_pos_off}               */",
-        f"#define META_FLAGS_OFF      (META_WRITE_POS_OFF + 2u)        /* = {meta_flags_off}               */",
-        f"#define META_HDR_SIZE       (META_FLAGS_OFF + 1u)            /* = {meta_hdr_size}               */",
+        f"#define META_MAGIC_B0       0x5Au  /* 'Z' */",
+        f"#define META_MAGIC_B1       0x49u  /* 'I' */",
+        f"#define META_MAGIC_B2       0x4Eu  /* 'N' */",
+        f"#define META_MAGIC_B3       0x46u  /* 'F' */",
+        f"#define META_FORMAT_VER     {meta_format_ver}u",
+        f"#define META_MAGIC_SIZE     {meta_magic_size}u     /* 4 magic + 2 version + 2 reserved */",
+        f"#define META_COPY_SLOT_BASE META_MAGIC_SIZE                            /* = {meta_copy_slot_base}  */",
+        f"#define META_COPY_STRIDE    {meta_copy_stride}u                                        /* bytes per copy slot */",
+        f"#define META_COPIES          {meta_copies}u                                        /* redundant copies    */",
+        f"#define META_WRITE_POS_OFF  (META_COPY_SLOT_BASE + META_COPIES * META_COPY_STRIDE) /* = {meta_write_pos_off} */",
+        f"#define META_FLAGS_OFF      (META_WRITE_POS_OFF + 2u)                              /* = {meta_flags_off} */",
+        f"#define META_HDR_SIZE       (META_FLAGS_OFF + 1u)                                  /* = {meta_hdr_size} */",
         "",
         "/* Message log capacity */",
         f"#define MSG_LOG_CAP_S0      (SECTOR_SIZE - META_HDR_SIZE)           /* {msg_log_cap_s0} bytes  */",

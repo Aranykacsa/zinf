@@ -27,7 +27,7 @@
 ┌─────────────────┐       ┌─────────────────────┐
 │  Helper / CRC   │       │   Config             │
 │  helper.c       │       │   config.c / .h      │
-│  crc32()        │       │   constants, codegen │
+│  zinf_crc32()   │       │   constants, codegen │
 └─────────────────┘       └─────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────┐
@@ -179,7 +179,7 @@ raid_sensor_values(ctx, sensor_t *buf, size_t len)   [api.c]
        ├─ for each PAYLOAD_SIZE-byte chunk:
        │    sector[0]      = header byte
        │    sector[1:508]  = payload
-       │    sector[508:512] = crc32(sector[0:508])
+       │    sector[508:512] = zinf_crc32(sector[0:508])
        │
        ├─ for mirror m in {0 … mirror_count-1}:
        │    addr = base_cursor + chunk_index + m * mirror_offset

@@ -112,7 +112,7 @@ Read a logical sector from all mirrors, verify CRC on each, then apply majority 
 uint8_t save_msg(zinf_ctx_t *ctx, uint8_t *msg);
 ```
 
-Append a single byte to the sequential message log. The log spans up to 991 bytes across `log_sector` (479 bytes after the 33-byte header) and `log_sector+1` (512 bytes).
+Append a single byte to the sequential message log. The log spans up to 983 bytes across `log_sector` (471 bytes after the 41-byte header) and `log_sector+1` (512 bytes).
 
 | Parameter | Description |
 |---|---|
@@ -121,7 +121,7 @@ Append a single byte to the sequential message log. The log spans up to 991 byte
 
 **Returns:** `STORAGE_OK`, `STORAGE_ERR_LOG_FULL`, or `STORAGE_ERR_DRIVER`
 
-**Capacity:** 991 bytes total (`MSG_LOG_TOTAL_CAP = MSG_LOG_CAP_S0 + MSG_LOG_CAP_S1`)
+**Capacity:** 983 bytes total (`MSG_LOG_TOTAL_CAP = MSG_LOG_CAP_S0 + MSG_LOG_CAP_S1`, where `MSG_LOG_CAP_S0 = 471`, `MSG_LOG_CAP_S1 = 512`)
 
 ---
 

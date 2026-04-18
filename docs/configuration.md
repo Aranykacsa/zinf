@@ -26,23 +26,27 @@ PAYLOAD_SIZE = SECTOR_SIZE - HEADER_SIZE - sizeof(uint32_t)
              = 507
 ```
 
-### Metadata Layout (format v3)
+### Metadata Layout (format v4)
 
 | Constant | Value | Description |
 |---|---|---|
+| `META_MAGIC_B0..B3` | `0x5A,0x49,0x4E,0x46` | Magic header (`ZINF` in ASCII) |
+| `META_FORMAT_VER` | `4` | On-disk format version |
+| `META_MAGIC_SIZE` | `8` | Magic header size (4 magic + 2 version + 2 reserved) |
+| `META_COPY_SLOT_BASE` | `8` | Byte offset where copy slots begin (= `META_MAGIC_SIZE`) |
 | `META_COPY_STRIDE` | `10` | Bytes per metadata copy slot (8 LBA + 2 version) |
 | `META_COPIES` | `3` | Number of redundant copy slots |
-| `META_WRITE_POS_OFF` | `30` | Offset of `write_pos` field (= `META_COPIES * META_COPY_STRIDE`) |
-| `META_FLAGS_OFF` | `32` | Offset of `flags` byte |
-| `META_HDR_SIZE` | `33` | Total metadata header size; message log starts here |
+| `META_WRITE_POS_OFF` | `38` | Offset of `write_pos` field (`META_COPY_SLOT_BASE + META_COPIES * META_COPY_STRIDE`) |
+| `META_FLAGS_OFF` | `40` | Offset of `flags` byte |
+| `META_HDR_SIZE` | `41` | Total metadata header size; message log starts here |
 
 ### Message Log Capacity
 
 | Constant | Value | Description |
 |---|---|---|
-| `MSG_LOG_CAP_S0` | `479` | Bytes in the first metadata sector (`SECTOR_SIZE - META_HDR_SIZE`) |
+| `MSG_LOG_CAP_S0` | `471` | Bytes in the first metadata sector (`SECTOR_SIZE - META_HDR_SIZE`) |
 | `MSG_LOG_CAP_S1` | `512` | Bytes in the second metadata sector |
-| `MSG_LOG_TOTAL_CAP` | `991` | Total message log capacity across both sectors |
+| `MSG_LOG_TOTAL_CAP` | `983` | Total message log capacity across both sectors |
 
 ---
 

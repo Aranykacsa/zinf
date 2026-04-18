@@ -18,40 +18,49 @@ The CRC covers both the header and the payload, so a corrupted header is also de
 
 ---
 
-## Log Metadata Sector (format v3 — 64-bit LBA)
+## Log Metadata Sector (format v4 — magic prefix + 64-bit LBA)
 
 The first sector (`log_sector`, default 0) stores log state. Its contents:
 
 ```
 Offset   Size   Field
 ------   ----   -----
-[Copy slot 0]
-0        8      last_sector  — last written data LBA (uint64, little-endian)
-8        2      version      — monotonic write counter (uint16, little-endian)
+[Magic header]
+0        4      Magic bytes: 'Z','I','N','F'  (0x5A 0x49 0x4E 0x46)
+4        2      Format version: 4 (uint16, little-endian)
+6        2      Reserved (0x00 0x00)
+
+[Copy slot 0 — starts at META_COPY_SLOT_BASE = 8]
+8        8      last_sector  — last written data LBA (uint64, little-endian)
+16       2      version      — monotonic write counter (uint16, little-endian)
 
 [Copy slot 1]
-10       8      last_sector  (same fields, redundant copy)
-18       2      version
+18       8      last_sector  (redundant copy)
+26       2      version
 
 [Copy slot 2]
-20       8      last_sector  (same fields, redundant copy)
-28       2      version
+28       8      last_sector  (redundant copy)
+36       2      version
 
 [Common fields]
-30       2      write_pos    — current message log write position (uint16, little-endian)
-32       1      flags        — reserved (0x00)
-33     479      Message log data (first 479 bytes)
+38       2      write_pos    — current message log write position (uint16, little-endian)
+40       1      flags        — reserved (0x00)
+41     471      Message log data (first 471 bytes)
 ```
 
 Constants (from `config.h`):
 
 | Constant | Value | Description |
 |---|---|---|
+| `META_MAGIC_B0..B3` | `0x5A,0x49,0x4E,0x46` | ASCII `ZINF` magic |
+| `META_FORMAT_VER` | `4` | On-disk format version |
+| `META_MAGIC_SIZE` | `8` | Magic header size (4 magic + 2 version + 2 reserved) |
+| `META_COPY_SLOT_BASE` | `8` | Byte offset where copy slots begin (= `META_MAGIC_SIZE`) |
 | `META_COPY_STRIDE` | `10` | Bytes per copy slot (8 LBA + 2 version) |
 | `META_COPIES` | `3` | Redundant copy slots |
-| `META_WRITE_POS_OFF` | `30` | Offset of `write_pos` field |
-| `META_FLAGS_OFF` | `32` | Offset of `flags` byte |
-| `META_HDR_SIZE` | `33` | Total header size; message log starts here |
+| `META_WRITE_POS_OFF` | `38` | Offset of `write_pos` field |
+| `META_FLAGS_OFF` | `40` | Offset of `flags` byte |
+| `META_HDR_SIZE` | `41` | Total header size; message log starts here |
 
 The adjacent sector (`log_sector + 1`) holds the continuation of the message log:
 
@@ -61,7 +70,7 @@ Offset   Size   Field
 0        512    Message log continuation (all 512 bytes)
 ```
 
-Total message log capacity: 479 + 512 = **991 bytes** (`MSG_LOG_TOTAL_CAP`)
+Total message log capacity: 471 + 512 = **983 bytes** (`MSG_LOG_TOTAL_CAP`)
 
 ### Version Counter
 
@@ -120,7 +129,7 @@ physical = base_cursor + chunk_index + mirror_num * mirror_offset
 ```
 Sector          Purpose
 ------          -------
-0               Log metadata (primary)   — 33-byte header + 479 bytes message log
+0               Log metadata (primary)   — 41-byte header + 471 bytes message log
 1               Log metadata (secondary) — 512 bytes message log continuation
 2 .. M-1        Data, Mirror 0
 M .. end-1      Data, Mirror 1 (physical = logical + mirror_offset)
@@ -144,12 +153,15 @@ Sectors 5121..10239 → data mirror 1  (5119 data sectors)
 After `init_log_sector()`, sector 0 contains:
 
 ```
-[0..9]   Copy slot 0: last_sector=0 (8 bytes LE), version=0 (2 bytes LE)
-[10..19] Copy slot 1: same zeros
-[20..29] Copy slot 2: same zeros
-[30..31] write_pos = 0 (2 bytes LE)
-[32]     flags = 0x00
-[33..511] 0x00 (empty message log)
+[0..3]   Magic: 0x5A 0x49 0x4E 0x46  ('Z','I','N','F')
+[4..5]   Version: 0x04 0x00
+[6..7]   Reserved: 0x00 0x00
+[8..17]  Copy slot 0: last_sector=0 (8 bytes LE), version=0 (2 bytes LE)
+[18..27] Copy slot 1: same zeros
+[28..37] Copy slot 2: same zeros
+[38..39] write_pos = 0 (2 bytes LE)
+[40]     flags = 0x00
+[41..511] 0x00 (empty message log)
 ```
 
 Sector 1 is zeroed entirely.

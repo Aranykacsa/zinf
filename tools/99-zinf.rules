@@ -1,0 +1,17 @@
+# ZINF filesystem identification — udev rule
+#
+# Prerequisites:
+#   sudo make install-probe      (builds and installs zinf-probe + this rule)
+#
+# After inserting a ZINF-formatted SD card:
+#   udevadm info /dev/sdX | grep ID_FS   → ID_FS_TYPE=zinf  ID_FS_VERSION=4
+#   lsblk --properties-by file,udev -f /dev/sdX  → FSTYPE=zinf  FSVER=4
+#
+# For standard `lsblk -f` and `blkid` recognition (uses libblkid directly):
+#   sudo make install-blkid      (patches + rebuilds libblkid with ZINF prober)
+#   then: lsblk -f /dev/sdX  →  FSTYPE=zinf
+#         blkid /dev/sdX     →  TYPE="zinf"
+
+SUBSYSTEM=="block", \
+  KERNEL!="dm-*|ram*|zram*|sr*", \
+  IMPORT{program}="/usr/local/bin/zinf-probe --udev %N"

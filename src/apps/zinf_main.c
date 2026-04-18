@@ -18,6 +18,9 @@
 extern zinf_ctx_t *zinf_ctx;
 extern driver_t    linux_driver;
 
+/* Active device path — overridden by -d <device> */
+static const char *g_device = "/dev/loop0";
+
 /* =========================================================
    CLI
    ========================================================= */
@@ -188,13 +191,26 @@ static void cli_rx_char(char c) {
    ========================================================= */
 
 static void print_usage(const char *argv0) {
-    printf("Usage:\n"
-           "  %s bench                Run benchmark (needs sudo)\n"
-           "  %s cli                  Interactive CLI\n"
-           "  %s read <img>           Image geometry info\n"
-           "  %s help                 Show this help\n"
-           "  %s <cmd...>             One-shot CLI command\n",
-           argv0, argv0, argv0, argv0, argv0);
+    printf("Usage: %s <command> [device]\n"
+           "\n"
+           "Commands:\n"
+           "  %s format <device>       Format a device or image as ZINF\n"
+           "  %s info   <device>       Show ZINF partition geometry\n"
+           "  %s bench  [device]       Throughput/latency benchmark (CSV to stdout)\n"
+           "  %s shell  [device]       Interactive command shell\n"
+           "  %s help                  Show this help\n"
+           "\n"
+           "Flag:\n"
+           "  -d <device>   Equivalent to passing device positionally\n"
+           "                (default: /dev/loop0)\n"
+           "\n"
+           "Examples:\n"
+           "  sudo %s format /dev/sdb\n"
+           "  %s info /dev/sdb\n"
+           "  sudo %s bench /dev/sdb > results.csv\n",
+           argv0,
+           argv0, argv0, argv0, argv0, argv0,
+           argv0, argv0, argv0);
 }
 
 static void join_argv(char *out, size_t out_sz, int argc, char **argv, int start) {
@@ -248,7 +264,7 @@ static uint64_t compute_raid_offset(const char *devpath) {
     if (fd < 0) { perror("open"); return 30u; }
 
     uint64_t bytes = 0;
-    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0) { perror("BLKGETSIZE64"); close(fd); return 30u; }
+    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0) { close(fd); return 30u; }
     close(fd);
 
     uint64_t total_sectors = bytes / SECTOR_SIZE;
@@ -325,7 +341,7 @@ static void sensor_generate(sensor_t *s, uint32_t tick) {
 }
 
 static int run_benchmark(void) {
-    const char *dev = "/dev/loop0";
+    const char *dev = g_device;
     printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten\n");
 
     int CHUNK_COUNTS[] = { 1,2,4,6,8,10,12,14,16,32,1024,2048,4096 };
@@ -378,12 +394,34 @@ static int run_benchmark(void) {
 }
 
 /* =========================================================
+   Format
+   ========================================================= */
+
+static int run_format(const char *dev) {
+    printf("Formatting %s as ZINF v%u...\n", dev, (unsigned)META_FORMAT_VER);
+    zinf_ctx->driver      = &linux_driver;
+    zinf_ctx->raid_offset = compute_raid_offset(dev);
+    uint8_t rc = setup_storage(zinf_ctx);
+    if (rc != STORAGE_OK) {
+        fprintf(stderr, "setup_storage failed (%u)\n", (unsigned)rc);
+        return 1;
+    }
+    rc = init_log_sector(zinf_ctx);
+    if (rc != STORAGE_OK) {
+        fprintf(stderr, "init_log_sector failed (%u)\n", (unsigned)rc);
+        return 1;
+    }
+    printf("Done. %s is now a ZINF v%u partition.\n", dev, (unsigned)META_FORMAT_VER);
+    return 0;
+}
+
+/* =========================================================
    CLI mode
    ========================================================= */
 
 static void cli_init_storage(void) {
     zinf_ctx->driver      = &linux_driver;
-    zinf_ctx->raid_offset = compute_raid_offset("/dev/loop0");
+    zinf_ctx->raid_offset = compute_raid_offset(g_device);
     if (setup_storage(zinf_ctx) != STORAGE_OK) {
         fprintf(stderr, "setup_storage failed (need sudo?)\n"); exit(1);
     }
@@ -411,17 +449,42 @@ static int run_cli_one_shot(int argc, char **argv, int start) {
    ========================================================= */
 
 int main(int argc, char **argv) {
-    /* Wire up the Linux driver into the default context */
+    /* Parse optional -d <device> before the mode argument */
+    int arg_start = 1;
+    if (argc >= 3 && strcmp(argv[1], "-d") == 0) {
+        g_device   = argv[2];
+        arg_start  = 3;
+    }
+
+    /* Wire up the Linux driver and point it at the selected device */
+    linux_driver_set_path(g_device);
     zinf_ctx->driver = &linux_driver;
 
-    if (argc < 2) { print_usage(argv[0]); return 0; }
-    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0)
+    if (argc < arg_start + 1) { print_usage(argv[0]); return 0; }
+
+    const char *mode = argv[arg_start];
+    if (strcmp(mode, "help") == 0 || strcmp(mode, "--help") == 0)
         { print_usage(argv[0]); return 0; }
-    if (strcmp(argv[1], "bench") == 0) return run_benchmark();
-    if (strcmp(argv[1], "cli")   == 0) return run_cli_interactive();
-    if (strcmp(argv[1], "read")  == 0) {
-        if (argc < 3) { fprintf(stderr, "usage: %s read <img>\n", argv[0]); return 2; }
-        return run_reader(argv[2]);
+
+    /* format: zinf format <device>  OR  zinf -d <device> format */
+    if (strcmp(mode, "format") == 0) {
+        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
+        linux_driver_set_path(dev);
+        return run_format(dev);
     }
-    return run_cli_one_shot(argc, argv, 1);
+
+    /* info: zinf info <device>  OR  zinf -d <device> info */
+    if (strcmp(mode, "info") == 0) {
+        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
+        return run_reader(dev);
+    }
+
+    if (strcmp(mode, "bench") == 0) return run_benchmark();
+    if (strcmp(mode, "shell") == 0 || strcmp(mode, "cli") == 0)
+        return run_cli_interactive();
+    if (strcmp(mode, "read")  == 0) {
+        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
+        return run_reader(dev);
+    }
+    return run_cli_one_shot(argc, argv, arg_start);
 }
