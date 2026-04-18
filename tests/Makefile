@@ -11,7 +11,8 @@ CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
          -I$(SRCDIR)/core/helper \
          -I$(SRCDIR)/platform \
          -I$(SRCDIR)/drivers \
-         -I$(SRCDIR)/drivers/linux
+         -I$(SRCDIR)/drivers/linux \
+         -I$(SRCDIR)/drivers/mock
 
 SRC = runner.c \
       test_crc.c \
@@ -22,6 +23,7 @@ SRC = runner.c \
       $(SRCDIR)/core/storage/storage.c \
       $(SRCDIR)/core/helper/helper.c \
       $(SRCDIR)/drivers/linux/linux_driver.c \
+      $(SRCDIR)/drivers/mock/ram_driver.c \
       $(SRCDIR)/platform/platform_linux.c
 
 OUT = run_tests
@@ -32,13 +34,25 @@ CSV_SRC = test_fault_csv.c \
           $(SRCDIR)/core/storage/storage.c \
           $(SRCDIR)/core/helper/helper.c \
           $(SRCDIR)/drivers/linux/linux_driver.c \
+          $(SRCDIR)/drivers/mock/ram_driver.c \
           $(SRCDIR)/platform/platform_linux.c
 
 CSV_OUT = run_fault_csv
 
 XLSX_LIBS := $(shell pkg-config --libs xlsxwriter 2>/dev/null || echo -lxlsxwriter)
 
-.PHONY: all run csv csv-fuzz clean
+REAL_SRC = test_realistic.c \
+           $(SRCDIR)/config/config.c \
+           $(SRCDIR)/core/api/api.c \
+           $(SRCDIR)/core/storage/storage.c \
+           $(SRCDIR)/core/helper/helper.c \
+           $(SRCDIR)/drivers/linux/linux_driver.c \
+           $(SRCDIR)/drivers/mock/ram_driver.c \
+           $(SRCDIR)/platform/platform_linux.c
+
+REAL_OUT = run_realistic
+
+.PHONY: all run csv csv-fuzz realistic realistic-brutal clean
 
 all: $(OUT)
 
@@ -52,11 +66,20 @@ $(CSV_OUT): $(CSV_SRC)
 	$(CC) $(CFLAGS) $(CSV_SRC) -o $(CSV_OUT) $(XLSX_LIBS)
 
 csv: $(CSV_OUT)
-	./$(CSV_OUT) -s fault_scenarios.csv -o fault_results.xlsx
+	./$(CSV_OUT) -M -n 100000 -o fault_results
 
 csv-fuzz: $(CSV_OUT)
-	./$(CSV_OUT) -s fault_scenarios.csv -o fault_results_fuzz.xlsx -n 100 -K 5 -v
+	./$(CSV_OUT) -M -R -n 1000000 -r 42 -o fault_results_fuzz
+
+$(REAL_OUT): $(REAL_SRC)
+	$(CC) $(CFLAGS) $(REAL_SRC) -o $(REAL_OUT) -lm
+
+realistic: $(REAL_OUT)
+	./$(REAL_OUT) -n 1000 -v
+
+realistic-brutal: $(REAL_OUT)
+	./$(REAL_OUT) -n 5000 -e 0.05 -v
 
 clean:
-	rm -f $(OUT) $(CSV_OUT) fault_results.xlsx fault_results_fuzz.xlsx \
+	rm -f $(OUT) $(CSV_OUT) $(REAL_OUT) *.csv.gz \
 	      /var/tmp/zinf_test.img /var/tmp/zinf_fault.img /var/tmp/zinf_csv_fault.img
