@@ -21,6 +21,10 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 | [Drivers](drivers.md) | `driver_t` interface and platform implementations |
 | [Configuration](configuration.md) | Constants, structs, and runtime settings |
 | [Benchmarking](benchmarking.md) | Running the benchmark and interpreting results |
+| [Fault Testing](fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
+| [Fuzz Analysis](fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
+| [Realistic Lifecycle Test](realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
+| [Advanced Test Suite](advanced-test.md) | 7 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O |
 | [Embedded Porting Guide](embedded-porting.md) | SPI wiring, CMakeLists.txt, and first-boot init for RP2350/Pico |
 
 ## Repository Layout
@@ -29,17 +33,20 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 zinf/
 ├── src/
 │   ├── apps/           # CLI / benchmark entry point (zinf_main.c)
-│   ├── config/         # Global constants and config struct
+│   ├── config/         # Global constants and config struct (generated from zinf.yaml)
 │   ├── core/
 │   │   ├── api/        # High-level storage API
 │   │   ├── storage/    # RAID write/read engine
-│   │   └── helper/     # CRC32 + driver interface definition
+│   │   └── helper/     # CRC32 + driver_t interface definition
 │   ├── drivers/
-│   │   ├── linux/      # Raw block device driver (O_DIRECT)
-│   │   └── embedded/   # Stub for custom embedded targets
-│   └── platform/       # Platform selection (active_driver, log_sector)
-├── tests/              # Functional tests and benchmark CSV/charts
-├── tools/              # Stress and endurance test programs
+│   │   ├── linux/      # Raw block device driver (O_DIRECT, pread/pwrite)
+│   │   ├── sd/         # SPI-mode SD/SDHC/SDXC driver (embedded targets)
+│   │   ├── mock/       # In-memory RAM driver for tests and fuzz engine
+│   │   └── embedded/   # Compilable stub — starting point for new drivers
+│   └── platform/       # platform_linux.c / platform_embedded.c
+├── tests/              # 28 unit tests + 172 CSV fault-injection scenarios
+├── tools/              # zinf_gen.py, zinf-probe.c, udev rules, libblkid patch
+├── zinf.yaml           # Master configuration (sector size, mirror count, data types)
 └── docs/               # This documentation
 ```
 

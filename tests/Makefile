@@ -52,7 +52,18 @@ REAL_SRC = test_realistic.c \
 
 REAL_OUT = run_realistic
 
-.PHONY: all run csv csv-fuzz realistic realistic-brutal clean
+ADV_SRC = test_advanced.c \
+          $(SRCDIR)/config/config.c \
+          $(SRCDIR)/core/api/api.c \
+          $(SRCDIR)/core/storage/storage.c \
+          $(SRCDIR)/core/helper/helper.c \
+          $(SRCDIR)/drivers/linux/linux_driver.c \
+          $(SRCDIR)/drivers/mock/ram_driver.c \
+          $(SRCDIR)/platform/platform_linux.c
+
+ADV_OUT = run_advanced
+
+.PHONY: all run csv csv-fuzz realistic realistic-brutal advanced clean
 
 all: $(OUT)
 
@@ -80,6 +91,13 @@ realistic: $(REAL_OUT)
 realistic-brutal: $(REAL_OUT)
 	./$(REAL_OUT) -n 5000 -e 0.05 -v
 
+$(ADV_OUT): $(ADV_SRC)
+	$(CC) $(CFLAGS) $(ADV_SRC) -o $(ADV_OUT) $(XLSX_LIBS) -lm
+
+advanced: $(ADV_OUT)
+	./$(ADV_OUT) -o advanced_results
+
 clean:
-	rm -f $(OUT) $(CSV_OUT) $(REAL_OUT) *.csv.gz \
-	      /var/tmp/zinf_test.img /var/tmp/zinf_fault.img /var/tmp/zinf_csv_fault.img
+	rm -f $(OUT) $(CSV_OUT) $(REAL_OUT) $(ADV_OUT) *.csv.gz advanced_results.xlsx \
+	      /var/tmp/zinf_test.img /var/tmp/zinf_fault.img /var/tmp/zinf_csv_fault.img \
+	      /var/tmp/zinf_advanced_loopback.img
