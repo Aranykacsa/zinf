@@ -341,7 +341,7 @@ static result_t bench_storage_wipe(lxw_worksheet *ws, xl_fmts_t *f, int n_iters)
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [1/7] StorageWipe       [%4d/%d] pass=%d fail=%d",
+            printf("\r  [1/11] StorageWipe       [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -489,7 +489,7 @@ static result_t bench_degraded_write(lxw_worksheet *ws, xl_fmts_t *f, int n_iter
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [2/7] DegradedWrite     [%4d/%d] pass=%d fail=%d",
+            printf("\r  [2/11] DegradedWrite     [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -606,7 +606,7 @@ static result_t bench_blacklist_overflow(lxw_worksheet *ws, xl_fmts_t *f, int n_
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [3/7] BlacklistOverflow [%4d/%d] pass=%d fail=%d",
+            printf("\r  [3/11] BlacklistOverflow [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -750,7 +750,7 @@ static result_t bench_metadata_corruption(lxw_worksheet *ws, xl_fmts_t *f, int n
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [4/7] MetadataCorruption[%4d/%d] pass=%d fail=%d",
+            printf("\r  [4/11] MetadataCorruption[%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -925,7 +925,7 @@ static result_t bench_version_wrap(lxw_worksheet *ws, xl_fmts_t *f, int n_iters)
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [5/7] VersionWrap       [%4d/%d] pass=%d fail=%d",
+            printf("\r  [5/11] VersionWrap       [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -1090,7 +1090,7 @@ static result_t bench_full_range_scrub(lxw_worksheet *ws, xl_fmts_t *f, int n_it
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [6/7] FullRangeScrub    [%4d/%d] pass=%d fail=%d",
+            printf("\r  [6/11] FullRangeScrub    [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -1247,7 +1247,7 @@ static result_t bench_loopback(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
         if (!r.pass) res.passed = 0;
 
         if ((i+1) % 100 == 0 || i == n_iters-1) {
-            printf("\r  [7/7] Loopback          [%4d/%d] pass=%d fail=%d",
+            printf("\r  [7/11] Loopback          [%4d/%d] pass=%d fail=%d",
                    i+1, n_iters, b.pass_n, i+1-b.pass_n);
             fflush(stdout);
         }
@@ -1270,6 +1270,831 @@ static result_t bench_loopback(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
     snprintf(res.metric, sizeof res.metric,
              "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms throughput=%.0f KB/s",
              100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms, avg_kbps);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 8 — Repair Cycle (10 rounds of corrupt → scrub → verify)
+   Per-iteration fuzz: n_records ∈ [100,400], fault_rate ∈ [1%,5%]
+   10 rounds per iteration: inject faults on random mirrors → power-cycle
+   scrub → verify all records. Cumulative damage tracked across rounds.
+   Excel sheet: one row per round (10 rows × 1000 iters = 10,000 rows)
+   Columns:
+     Iter | Seed | Round | N-Records | Fault-Rate(%) | Faults |
+     Repaired | New-Unrec | Cum-Unrec | Verify-OK | Verify-Lost | Silent | Pass
+   ======================================================================= */
+
+typedef struct {
+    int      pass;           /* 1 if all 10 rounds had silent=0 */
+    long     total_ops;
+    int      n_records;
+    float    fault_rate;
+    int      faults[10];
+    int      repaired[10];
+    int      new_unrec[10];
+    int      cum_unrec[10];
+    int      ok[10];
+    int      lost[10];
+    int      silent[10];
+    uint32_t seed;
+} rc_iter_t;
+
+static rc_iter_t run_repair_cycle(uint32_t seed, int n_records, float fault_rate) {
+    rc_iter_t r;
+    memset(&r, 0, sizeof r);
+    r.seed       = seed;
+    r.n_records  = n_records;
+    r.fault_rate = fault_rate;
+    r.pass       = 1;
+
+    zinf_ctx_t ctx;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng = seed;
+
+    /* Shadow buffer — max 400 entries */
+    uint64_t shadow_lba[400];
+    float    shadow_temp[400], shadow_hum[400];
+    int      shadow_lost[400];
+    memset(shadow_lost, 0, sizeof shadow_lost);
+
+    /* Initial write batch */
+    for (int i = 0; i < n_records; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        shadow_lba[i]  = lb + 1u;
+        shadow_temp[i] = (float)(lcg_r(&rng) % 10000u);
+        shadow_hum[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=shadow_temp[i], .humidity=shadow_hum[i]};
+        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
+        if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) r.pass = 0;
+        r.total_ops++;
+    }
+
+    uint64_t last_lba = 0; get_last_sector(&ctx, &last_lba);
+    int cum_unrec = 0;
+
+    for (int round = 0; round < 10; round++) {
+        /* ---- Fault injection ---- */
+        int n_faults = (int)((float)n_records * fault_rate);
+        if (n_faults < 1) n_faults = 1;
+        r.faults[round] = n_faults;
+
+        for (int fi = 0; fi < n_faults; fi++) {
+            int      rec_idx = (int)(lcg_r(&rng) % (uint32_t)n_records);
+            uint64_t log_lba = shadow_lba[rec_idx];
+            int      mirror  = (int)(lcg_r(&rng) & 1u);
+            uint64_t phys    = log_lba + (uint64_t)mirror * (uint64_t)ADV_MIRROR_OFF;
+            uint32_t off     = lcg_r(&rng) % (uint32_t)SECTOR_SIZE;
+            uint8_t  val     = (uint8_t)(lcg_r(&rng) & 0xFFu);
+            ram_driver_corrupt(phys, off, val);
+        }
+
+        /* ---- Power-cycle scrub ---- */
+        zinf_clear_bad_sectors(&ctx);
+        zinf_scrub_report_t rep = {0};
+        zinf_scrub(&ctx, 2u, last_lba, &rep);
+        r.repaired[round] = (int)rep.repaired;
+
+        /* ---- Verify all records ---- */
+        int newly_lost = 0, ok = 0, lost_total = 0, silent = 0;
+        uint8_t payload[PAYLOAD_SIZE];
+
+        for (int i = 0; i < n_records; i++) {
+            if (shadow_lost[i]) { lost_total++; continue; }
+            uint8_t rc = raid_read(&ctx, shadow_lba[i], payload);
+            r.total_ops++;
+            if (rc == STORAGE_ERR_UNRECOVERABLE) {
+                shadow_lost[i] = 1;
+                newly_lost++;
+                lost_total++;
+            } else if (rc == STORAGE_OK || rc == STORAGE_WARN_DEGRADED) {
+                float gt = unpack_f32(&payload[0]);
+                float gh = unpack_f32(&payload[4]);
+                if (fabsf(gt - shadow_temp[i]) < 0.001f &&
+                    fabsf(gh - shadow_hum[i])  < 0.001f)
+                    ok++;
+                else { silent++; r.pass = 0; }
+            }
+        }
+
+        cum_unrec         += newly_lost;
+        r.new_unrec[round] = newly_lost;
+        r.cum_unrec[round] = cum_unrec;
+        r.ok[round]        = ok;
+        r.lost[round]      = lost_total;
+        r.silent[round]    = silent;
+    }
+
+    ctx_teardown(&ctx);
+    return r;
+}
+
+static result_t bench_repair_cycle(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "RepairCycle",
+        "Write records once, then 10 rounds of: inject realistic faults (1-5%) on random "
+        "mirrors → power-cycle scrub → verify all records. Cumulative damage tracked. "
+        "silent must always be 0. Fuzz: n_records ∈ [100,400], fault_rate ∈ [1%,5%].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Round","N-Records","Fault-Rate(%)","Faults",
+        "Repaired","New-Unrec","Cum-Unrec","Verify-OK","Verify-Lost","Silent","Pass"
+    };
+    for (int c = 0; c < 13; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 7, 11, 14, 8, 10, 11, 11, 11, 13, 8, 6 };
+    set_col_widths(ws, w, 13);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed       = lcg();
+        int      n_records  = 100 + (int)(lcg() % 301u);
+        float    fault_rate = 0.01f + (float)(lcg() % 5u) * 0.01f;  /* 1–5% */
+
+        double t0 = now_ms();
+        rc_iter_t r = run_repair_cycle(seed, n_records, fault_rate);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? (double)r.total_ops * 1000.0 / elapsed : 0.0;
+
+        long iter_silent = 0;
+        for (int rnd = 0; rnd < 10; rnd++) iter_silent += r.silent[rnd];
+
+        bench_record(&b, i, elapsed, r.total_ops, iter_silent, r.pass);
+
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+
+        /* One row per round */
+        for (int rnd = 0; rnd < 10; rnd++) {
+            lxw_row_t   row     = (lxw_row_t)(i * 10 + rnd + 1);
+            int         rnd_ok  = (r.silent[rnd] == 0);
+            lxw_format *fmt     = xfmt(f, rnd_ok);
+
+            worksheet_write_number(ws, row,  0, i+1,                           fmt);
+            worksheet_write_string(ws, row,  1, seed_s,                        fmt);
+            worksheet_write_number(ws, row,  2, rnd+1,                         fmt);
+            worksheet_write_number(ws, row,  3, n_records,                     fmt);
+            worksheet_write_number(ws, row,  4, (double)(fault_rate * 100.0f), fmt);
+            worksheet_write_number(ws, row,  5, r.faults[rnd],                 fmt);
+            worksheet_write_number(ws, row,  6, r.repaired[rnd],               fmt);
+            worksheet_write_number(ws, row,  7, r.new_unrec[rnd],              fmt);
+            worksheet_write_number(ws, row,  8, r.cum_unrec[rnd],              fmt);
+            worksheet_write_number(ws, row,  9, r.ok[rnd],                     fmt);
+            worksheet_write_number(ws, row, 10, r.lost[rnd],                   fmt);
+            worksheet_write_number(ws, row, 11, r.silent[rnd],                 fmt);
+            worksheet_write_string(ws, row, 12, rnd_ok ? "PASS" : "FAIL",      fmt);
+        }
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [8/11] RepairCycle       [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+
+        (void)ops_ps;  /* reported via metric string */
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 9 — Message Log Interleave
+   Interleave raid_sensor_values and save_msg. n_msgs > 471 triggers overflow
+   to log_sector+1. Records must not be corrupted after overflow.
+   Fuzz: n_records ∈ [10,50], n_msgs ∈ [200,600]
+   Columns:
+     Iter | Seed | N-Records | N-Msgs | Overflow-Triggered |
+     Records-OK | Records-Silent | Msgs-OK | Elapsed(ms) | Pass
+   ======================================================================= */
+
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_records, n_msgs;
+    int      overflow_triggered;
+    long     records_ok, records_silent;
+    long     msgs_ok;
+    uint32_t seed;
+} mli_iter_t;
+
+static mli_iter_t run_msg_log_interleave(uint32_t seed, int n_records, int n_msgs) {
+    mli_iter_t r;
+    memset(&r, 0, sizeof r);
+    r.pass = 1; r.seed = seed;
+    r.n_records = n_records; r.n_msgs = n_msgs;
+
+    zinf_ctx_t ctx;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng   = seed;
+    uint64_t lbas[50]; float temps[50], hums[50];
+    uint8_t  msg_vals[600];
+    int      msg_count = 0;
+
+    /* Interleave: drain msgs proportionally before each sensor write */
+    for (int i = 0; i < n_records; i++) {
+        int target = (i + 1) * n_msgs / n_records;
+        while (msg_count < target && msg_count < n_msgs) {
+            msg_vals[msg_count] = (uint8_t)(lcg_r(&rng) & 0xFFu);
+            save_msg(&ctx, &msg_vals[msg_count]);
+            msg_count++;
+        }
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
+        if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) r.pass = 0;
+        r.ops++;
+    }
+    /* Drain any remaining msgs */
+    while (msg_count < n_msgs) {
+        msg_vals[msg_count] = (uint8_t)(lcg_r(&rng) & 0xFFu);
+        save_msg(&ctx, &msg_vals[msg_count]);
+        msg_count++;
+    }
+    r.overflow_triggered = (msg_count > (int)MSG_LOG_CAP_S0);
+
+    /* Verify sensor records */
+    uint8_t payload[PAYLOAD_SIZE];
+    for (int i = 0; i < n_records; i++) {
+        uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+        r.ops++;
+        if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.pass = 0; continue; }
+        if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+        float gt = unpack_f32(&payload[0]);
+        float gh = unpack_f32(&payload[4]);
+        if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+            r.records_ok++;
+        else { r.records_silent++; r.pass = 0; }
+    }
+
+    /* Verify message log byte content via raw sector reads */
+    {
+        int expected = msg_count < (int)MSG_LOG_TOTAL_CAP
+                       ? msg_count : (int)MSG_LOG_TOTAL_CAP;
+        uint8_t meta0[SECTOR_SIZE];
+        read_sector(&ctx, ctx.log_sector, meta0);
+
+        int s0_bytes = expected < (int)MSG_LOG_CAP_S0
+                       ? expected : (int)MSG_LOG_CAP_S0;
+        for (int m = 0; m < s0_bytes; m++) {
+            if (meta0[META_HDR_SIZE + m] == msg_vals[m])
+                r.msgs_ok++;
+            else
+                r.pass = 0;
+        }
+        if (expected > (int)MSG_LOG_CAP_S0) {
+            uint8_t meta1[SECTOR_SIZE];
+            read_sector(&ctx, ctx.log_sector + 1u, meta1);
+            int s1_bytes = expected - (int)MSG_LOG_CAP_S0;
+            for (int m = 0; m < s1_bytes; m++) {
+                if (meta1[m] == msg_vals[(int)MSG_LOG_CAP_S0 + m])
+                    r.msgs_ok++;
+                else
+                    r.pass = 0;
+            }
+        }
+    }
+
+    if (r.records_silent > 0) r.pass = 0;
+    ctx_teardown(&ctx);
+    return r;
+}
+
+static result_t bench_msg_log_interleave(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "MsgLogInterleave",
+        "Interleave raid_sensor_values and save_msg. n_msgs>471 triggers overflow to "
+        "log_sector+1. Records undamaged; message bytes match exactly. "
+        "Fuzz: n_records ∈ [10,50], n_msgs ∈ [200,600].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","N-Records","N-Msgs","Overflow-Triggered",
+        "Records-OK","Records-Silent","Msgs-OK","Elapsed(ms)","Pass"
+    };
+    for (int c = 0; c < 10; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 10, 8, 19, 12, 15, 10, 12, 6 };
+    set_col_widths(ws, w, 10);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        int      n_records = 10 + (int)(lcg() % 41u);
+        int      n_msgs    = 200 + (int)(lcg() % 401u);
+
+        double t0 = now_ms();
+        mli_iter_t r = run_msg_log_interleave(seed, n_records, n_msgs);
+        double elapsed = now_ms() - t0;
+
+        bench_record(&b, i, elapsed, r.ops, r.records_silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                              fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                           fmt);
+        worksheet_write_number(ws, row, 2, n_records,                        fmt);
+        worksheet_write_number(ws, row, 3, n_msgs,                           fmt);
+        worksheet_write_string(ws, row, 4, r.overflow_triggered ? "yes":"no",fmt);
+        worksheet_write_number(ws, row, 5, (double)r.records_ok,             fmt);
+        worksheet_write_number(ws, row, 6, (double)r.records_silent,         fmt);
+        worksheet_write_number(ws, row, 7, (double)r.msgs_ok,                fmt);
+        worksheet_write_number(ws, row, 8, elapsed,                          fmt);
+        worksheet_write_string(ws, row, 9, r.pass ? "PASS" : "FAIL",         fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [9/11] MsgLogInterleave [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 10 — Disk Full
+   Write until STORAGE_ERR_FULL. Verify exact boundary; verify pre-full
+   records intact; verify 5 post-error writes all return STORAGE_ERR_FULL.
+   Uses a 1024-sector image so the test runs in ~500 writes per iteration.
+   Fuzz: n_prefill ∈ [10,50]
+   Columns:
+     Iter | Seed | Pre-Fill | Fills-Until-Full | Post-Err-Rejected |
+     Total-Writes | Capacity | Records-OK | Silent | Pass
+   ======================================================================= */
+
+#define DISKFULL_SECTS 1024u
+#define DISKFULL_MO    ((DISKFULL_SECTS - 2u) / (uint32_t)RAID_MIRRORS)  /* = 511 */
+
+static int setup_diskfull(zinf_ctx_t *ctx) {
+    memset(ctx, 0, sizeof *ctx);
+    ram_driver_set_capacity(DISKFULL_SECTS);
+    ctx->driver           = &ram_driver;
+    ctx->sector_size      = SECTOR_SIZE;
+    ctx->mirror_count     = RAID_MIRRORS;
+    ctx->metadata_sectors = 2;
+    ctx->mirror_offset    = DISKFULL_MO;
+    ctx->log_sector       = 0;
+    ctx->raid_offset      = ctx->mirror_offset;
+    if (ctx->driver->init(ctx->driver) != DRIVER_OK) return -1;
+    if (init_log_sector(ctx)           != STORAGE_OK) return -1;
+    return 0;
+}
+
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_prefill;
+    int      fills_until_full;
+    int      post_err_rejected;
+    long     records_ok, silent;
+    uint32_t seed;
+} df_iter_t;
+
+static df_iter_t run_disk_full(uint32_t seed, int n_prefill) {
+    df_iter_t r;
+    memset(&r, 0, sizeof r);
+    r.pass = 1; r.seed = seed; r.n_prefill = n_prefill;
+
+    zinf_ctx_t ctx;
+    if (setup_diskfull(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng = seed;
+    uint64_t lbas[50]; float temps[50], hums[50];
+
+    /* Prefill n_prefill records */
+    for (int i = 0; i < n_prefill; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
+        if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) { r.pass = 0; goto done; }
+        r.ops++;
+    }
+
+    /* Fill until STORAGE_ERR_FULL */
+    {
+        sensor_t s = {.temp=0.0f, .humidity=0.0f};
+        for (;;) {
+            uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
+            r.ops++;
+            if (wrc == STORAGE_ERR_FULL) break;
+            if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) { r.pass = 0; goto done; }
+            r.fills_until_full++;
+        }
+    }
+
+    /* 5 more writes after FULL — all must return STORAGE_ERR_FULL */
+    {
+        sensor_t s = {.temp=1.0f, .humidity=1.0f};
+        for (int i = 0; i < 5; i++) {
+            uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
+            r.ops++;
+            if (wrc == STORAGE_ERR_FULL) r.post_err_rejected++;
+            else                          r.pass = 0;
+        }
+    }
+
+    /* Verify last_sector is within the valid mirror-0 range */
+    {
+        uint64_t last = 0;
+        get_last_sector(&ctx, &last);
+        uint64_t m0_ceiling = (uint64_t)ctx.metadata_sectors + ctx.mirror_offset;
+        if (last >= m0_ceiling) r.pass = 0;
+    }
+
+    /* Verify total writes == capacity (mirror_offset) */
+    {
+        int total   = n_prefill + r.fills_until_full;
+        int capacity = (int)ctx.mirror_offset;  /* = DISKFULL_MO = 511 */
+        if (total != capacity) r.pass = 0;
+    }
+
+    /* Verify prefill records are intact */
+    {
+        uint8_t payload[PAYLOAD_SIZE];
+        for (int i = 0; i < n_prefill; i++) {
+            uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+            r.ops++;
+            if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.pass = 0; continue; }
+            if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+            float gt = unpack_f32(&payload[0]);
+            float gh = unpack_f32(&payload[4]);
+            if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+                r.records_ok++;
+            else { r.silent++; r.pass = 0; }
+        }
+    }
+
+done:
+    ctx_teardown(&ctx);
+    /* Restore capacity for subsequent tests that use setup_ram */
+    ram_driver_set_capacity(ADV_IMG_SECTS);
+    return r;
+}
+
+static result_t bench_disk_full(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "DiskFull",
+        "Write 1024-sector image to capacity. STORAGE_ERR_FULL must fire exactly at "
+        "mirror_offset writes. 5 post-error writes must all return STORAGE_ERR_FULL. "
+        "Pre-fill records remain intact. Fuzz: n_prefill ∈ [10,50].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Pre-Fill","Fills-Until-Full","Post-Err-Rejected",
+        "Total-Writes","Capacity","Records-OK","Silent","Pass"
+    };
+    for (int c = 0; c < 10; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 9, 17, 18, 13, 10, 12, 8, 6 };
+    set_col_widths(ws, w, 10);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed     = lcg();
+        int      n_prefill = 10 + (int)(lcg() % 41u);
+
+        double t0 = now_ms();
+        df_iter_t r = run_disk_full(seed, n_prefill);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                            fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                         fmt);
+        worksheet_write_number(ws, row, 2, n_prefill,                      fmt);
+        worksheet_write_number(ws, row, 3, r.fills_until_full,             fmt);
+        worksheet_write_number(ws, row, 4, r.post_err_rejected,            fmt);
+        worksheet_write_number(ws, row, 5, n_prefill + r.fills_until_full, fmt);
+        worksheet_write_number(ws, row, 6, (double)DISKFULL_MO,            fmt);
+        worksheet_write_number(ws, row, 7, (double)r.records_ok,           fmt);
+        worksheet_write_number(ws, row, 8, (double)r.silent,               fmt);
+        worksheet_write_string(ws, row, 9, r.pass ? "PASS" : "FAIL",       fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [10/11] DiskFull        [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+
+        (void)ops_ps;
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 11 — Double Fault
+   Two sub-scenarios per iteration using the same initial write batch:
+   A: corrupt mirror-0 → recover → new fault on mirror-1 → scrub → readable
+   B: corrupt mirror-0 → recover → corrupt mirror-0 again → corrupt mirror-1
+      → scrub → STORAGE_ERR_UNRECOVERABLE, all other records still intact
+   PASS = scen_a_pass && scen_b_pass && silent == 0.
+   Fuzz: n_records ∈ [20,100], sector_x = random record index
+   Columns:
+     Iter | Seed | N-Records | Sector-X | ScenA-Pass | ScenB-Pass | Silent | Pass
+   ======================================================================= */
+
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_records;
+    int      sector_x;
+    int      scen_a_pass;
+    int      scen_b_pass;
+    long     silent;
+    uint32_t seed;
+} dft_iter_t;
+
+/* Write n_records into ctx, filling shadow_lba/temp/hum arrays. */
+static void dft_write_records(zinf_ctx_t *ctx, uint32_t *rng, int n_records,
+                               uint64_t *shadow_lba, float *shadow_temp,
+                               float *shadow_hum, long *ops) {
+    for (int i = 0; i < n_records; i++) {
+        uint64_t lb = 0; get_last_sector(ctx, &lb);
+        shadow_lba[i]  = lb + 1u;
+        shadow_temp[i] = (float)(lcg_r(rng) % 10000u);
+        shadow_hum[i]  = (float)(lcg_r(rng) % 100u);
+        sensor_t s = {.temp=shadow_temp[i], .humidity=shadow_hum[i]};
+        raid_sensor_values(ctx, &s, 1);
+        (*ops)++;
+    }
+}
+
+static dft_iter_t run_double_fault(uint32_t seed, int n_records, int sector_x) {
+    dft_iter_t r;
+    memset(&r, 0, sizeof r);
+    r.pass = 1; r.seed = seed;
+    r.n_records = n_records; r.sector_x = sector_x;
+
+    uint64_t shadow_lba[100]; float shadow_temp[100], shadow_hum[100];
+
+    /* ---- Sub-scenario A ---- */
+    {
+        zinf_ctx_t ctx;
+        if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+        uint32_t rng = seed;
+        dft_write_records(&ctx, &rng, n_records,
+                          shadow_lba, shadow_temp, shadow_hum, &r.ops);
+
+        uint64_t lba_x  = shadow_lba[sector_x];
+        uint64_t m0_phys = lba_x;
+        uint64_t m1_phys = lba_x + (uint64_t)ADV_MIRROR_OFF;
+
+        /* Step 1: corrupt mirror 0 */
+        ram_driver_corrupt(m0_phys, 2u, 0xDEu);
+
+        /* Step 2: recover sector — repairs mirror 0 from mirror 1 */
+        uint8_t rec = zinf_recover_sector(&ctx, lba_x);
+        if (rec != STORAGE_OK) { r.scen_a_pass = 0; r.pass = 0; goto done_a; }
+
+        /* Step 3: new fault on mirror 1 (simulates power-loss after repair) */
+        ram_driver_corrupt(m1_phys, 2u, 0xBEu);
+
+        /* Step 4: scrub single sector — should repair mirror 1 from mirror 0 */
+        zinf_clear_bad_sectors(&ctx);
+        zinf_scrub_report_t rep = {0};
+        zinf_scrub(&ctx, lba_x, lba_x, &rep);
+
+        /* Step 5: read back — must succeed with correct data */
+        {
+            uint8_t payload[PAYLOAD_SIZE];
+            uint8_t rrc = raid_read(&ctx, lba_x, payload);
+            r.ops++;
+            if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
+                float gt = unpack_f32(&payload[0]);
+                float gh = unpack_f32(&payload[4]);
+                if (fabsf(gt - shadow_temp[sector_x]) < 0.001f &&
+                    fabsf(gh - shadow_hum[sector_x])  < 0.001f)
+                    r.scen_a_pass = 1;
+                else { r.silent++; r.pass = 0; }
+            } else {
+                r.scen_a_pass = 0; r.pass = 0;
+            }
+        }
+
+done_a:
+        ctx_teardown(&ctx);
+    }
+
+    /* ---- Sub-scenario B ---- */
+    {
+        zinf_ctx_t ctx;
+        if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+        uint32_t rng = seed;
+        dft_write_records(&ctx, &rng, n_records,
+                          shadow_lba, shadow_temp, shadow_hum, &r.ops);
+
+        uint64_t lba_x   = shadow_lba[sector_x];
+        uint64_t m0_phys  = lba_x;
+        uint64_t m1_phys  = lba_x + (uint64_t)ADV_MIRROR_OFF;
+
+        /* Step 1: corrupt mirror 0 (pattern A) */
+        ram_driver_corrupt(m0_phys, 2u, 0xDEu);
+
+        /* Step 2: recover — mirrors mirror 1 into mirror 0 */
+        zinf_recover_sector(&ctx, lba_x);
+
+        /* Step 3: corrupt mirror 0 again (pattern B — different value) */
+        ram_driver_corrupt(m0_phys, 3u, 0xADu);
+
+        /* Step 4: corrupt mirror 1 (pattern C) */
+        ram_driver_corrupt(m1_phys, 4u, 0xBEu);
+
+        /* Step 5: scrub — both mirrors bad → unrecoverable, LBAs blacklisted */
+        zinf_clear_bad_sectors(&ctx);
+        zinf_scrub_report_t rep = {0};
+        zinf_scrub(&ctx, lba_x, lba_x, &rep);
+        /* rep.unrecoverable should be 1 */
+
+        /* Step 6: read sector_x → must be STORAGE_ERR_UNRECOVERABLE */
+        {
+            uint8_t payload[PAYLOAD_SIZE];
+            uint8_t rrc = raid_read(&ctx, lba_x, payload);
+            r.ops++;
+            if (rrc == STORAGE_ERR_UNRECOVERABLE) {
+                r.scen_b_pass = 1;
+            } else if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
+                /* Got data back — check if it's wrong (silent corruption) */
+                float gt = unpack_f32(&payload[0]);
+                float gh = unpack_f32(&payload[4]);
+                if (fabsf(gt - shadow_temp[sector_x]) > 0.001f ||
+                    fabsf(gh - shadow_hum[sector_x])  > 0.001f)
+                    r.silent++;
+                /* Whether correct or wrong, sub-B expected UNRECOVERABLE */
+                r.scen_b_pass = 0; r.pass = 0;
+            } else {
+                r.scen_b_pass = 0; r.pass = 0;
+            }
+        }
+
+        /* Step 7: read all other records — must all be intact */
+        {
+            uint8_t payload[PAYLOAD_SIZE];
+            for (int i = 0; i < n_records; i++) {
+                if (i == sector_x) continue;
+                uint8_t rrc = raid_read(&ctx, shadow_lba[i], payload);
+                r.ops++;
+                if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.pass = 0; continue; }
+                if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+                float gt = unpack_f32(&payload[0]);
+                float gh = unpack_f32(&payload[4]);
+                if (fabsf(gt - shadow_temp[i]) > 0.001f ||
+                    fabsf(gh - shadow_hum[i])  > 0.001f) {
+                    r.silent++; r.pass = 0;
+                }
+            }
+        }
+
+        ctx_teardown(&ctx);
+    }
+
+    if (!r.scen_a_pass || !r.scen_b_pass || r.silent > 0) r.pass = 0;
+    return r;
+}
+
+static result_t bench_double_fault(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "DoubleFault",
+        "Sub-A: recover → new fault on mirror-1 → scrub → sector still readable. "
+        "Sub-B: recover → double-corrupt both mirrors → scrub → STORAGE_ERR_UNRECOVERABLE, "
+        "all other records intact. silent must always be 0. "
+        "Fuzz: n_records ∈ [20,100], sector_x random.",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","N-Records","Sector-X",
+        "ScenA-Pass","ScenB-Pass","Silent","Pass"
+    };
+    for (int c = 0; c < 8; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 11, 10, 12, 12, 8, 6 };
+    set_col_widths(ws, w, 8);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        int      n_records = 20 + (int)(lcg() % 81u);
+        int      sector_x  = (int)(lcg() % (uint32_t)n_records);
+
+        double t0 = now_ms();
+        dft_iter_t r = run_double_fault(seed, n_records, sector_x);
+        double elapsed = now_ms() - t0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                              fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                           fmt);
+        worksheet_write_number(ws, row, 2, n_records,                        fmt);
+        worksheet_write_number(ws, row, 3, sector_x,                         fmt);
+        worksheet_write_string(ws, row, 4, r.scen_a_pass ? "PASS" : "FAIL",  fmt);
+        worksheet_write_string(ws, row, 5, r.scen_b_pass ? "PASS" : "FAIL",  fmt);
+        worksheet_write_number(ws, row, 6, (double)r.silent,                 fmt);
+        worksheet_write_string(ws, row, 7, r.pass ? "PASS" : "FAIL",         fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [11/11] DoubleFault     [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
     bench_free(&b);
     printf("\n");
     return res;
@@ -1347,27 +2172,29 @@ int main(int argc, char *argv[]) {
     lxw_workbook  *wb     = workbook_new(xl_path);
     xl_fmts_t      fmts   = make_formats(wb);
 
-    lxw_worksheet *ws_sum   = workbook_add_worksheet(wb, "Summary");
-    lxw_worksheet *ws_wipe  = workbook_add_worksheet(wb, "StorageWipe");
-    lxw_worksheet *ws_deg   = workbook_add_worksheet(wb, "DegradedWrite");
-    lxw_worksheet *ws_blk   = workbook_add_worksheet(wb, "BlacklistOverflow");
-    lxw_worksheet *ws_meta  = workbook_add_worksheet(wb, "MetadataCorruption");
-    lxw_worksheet *ws_ver   = workbook_add_worksheet(wb, "VersionWrap");
-    lxw_worksheet *ws_scrub = workbook_add_worksheet(wb, "FullRangeScrub");
-    lxw_worksheet *ws_loop  = workbook_add_worksheet(wb, "Loopback");
+    lxw_worksheet *ws_sum    = workbook_add_worksheet(wb, "Summary");
+    lxw_worksheet *ws_wipe   = workbook_add_worksheet(wb, "StorageWipe");
+    lxw_worksheet *ws_deg    = workbook_add_worksheet(wb, "DegradedWrite");
+    lxw_worksheet *ws_blk    = workbook_add_worksheet(wb, "BlacklistOverflow");
+    lxw_worksheet *ws_meta   = workbook_add_worksheet(wb, "MetadataCorruption");
+    lxw_worksheet *ws_ver    = workbook_add_worksheet(wb, "VersionWrap");
+    lxw_worksheet *ws_scrub  = workbook_add_worksheet(wb, "FullRangeScrub");
+    lxw_worksheet *ws_loop   = workbook_add_worksheet(wb, "Loopback");
+    lxw_worksheet *ws_repair = workbook_add_worksheet(wb, "RepairCycle");
 
     printf("ZINF advanced benchmark — %d iterations per test\n", n_iters);
 
-    result_t results[7];
-    results[0] = bench_storage_wipe       (ws_wipe,  &fmts, n_iters);
-    results[1] = bench_degraded_write     (ws_deg,   &fmts, n_iters);
-    results[2] = bench_blacklist_overflow (ws_blk,   &fmts, n_iters);
-    results[3] = bench_metadata_corruption(ws_meta,  &fmts, n_iters);
-    results[4] = bench_version_wrap       (ws_ver,   &fmts, n_iters);
-    results[5] = bench_full_range_scrub   (ws_scrub, &fmts, n_iters);
-    results[6] = bench_loopback           (ws_loop,  &fmts, n_iters);
+    result_t results[8];
+    results[0] = bench_storage_wipe       (ws_wipe,   &fmts, n_iters);
+    results[1] = bench_degraded_write     (ws_deg,    &fmts, n_iters);
+    results[2] = bench_blacklist_overflow (ws_blk,    &fmts, n_iters);
+    results[3] = bench_metadata_corruption(ws_meta,   &fmts, n_iters);
+    results[4] = bench_version_wrap       (ws_ver,    &fmts, n_iters);
+    results[5] = bench_full_range_scrub   (ws_scrub,  &fmts, n_iters);
+    results[6] = bench_loopback           (ws_loop,   &fmts, n_iters);
+    results[7] = bench_repair_cycle       (ws_repair, &fmts, n_iters);
 
-    write_summary(ws_sum, &fmts, results, 7);
+    write_summary(ws_sum, &fmts, results, 8);
     workbook_close(wb);
 
     printf("\nResults → %s\n\n", xl_path);
@@ -1377,7 +2204,7 @@ int main(int argc, char *argv[]) {
            "----", "----", "----", "----", "------");
 
     int any_fail = 0;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 8; i++) {
         result_t *r = &results[i];
         printf("%-22s %6d %6d %6d  %s\n",
                r->name, r->n_iter, r->pass_n, r->fail_n, r->metric);

@@ -15,7 +15,8 @@ CFLAGS = -Wall -Wextra -Wpedantic -Wshadow -Wundef \
          -I./core/helper \
          -I./platform \
          -I./drivers \
-         -I./drivers/linux
+         -I./drivers/linux \
+         -I./drivers/mock
 
 SRC = \
     apps/zinf_main.c \
@@ -24,7 +25,8 @@ SRC = \
     core/api/api.c \
     core/storage/storage.c \
     core/helper/helper.c \
-    drivers/linux/*.c
+    drivers/linux/*.c \
+    drivers/mock/ram_driver.c
 
 OUT = zinf
 

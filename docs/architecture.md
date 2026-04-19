@@ -20,7 +20,7 @@
 │               Storage Engine                     │
 │   storage.c / storage.h                          │
 │   RAID mirroring, CRC32 stamping,                │
-│   log metadata management (format v3)            │
+│   log metadata management (format v4)            │
 └───────────┬───────────────────────┬──────────────┘
             │                       │
             ▼                       ▼
@@ -37,12 +37,12 @@
 └───────────┬───────────────────────┬──────────────┘
             │                       │
             ▼                       ▼
-┌──────────────────┐     ┌──────────────────────────┐
-│  Linux Driver    │     │  SD Card Driver          │
-│  linux_driver.c  │     │  sd_driver.c             │
-│  O_DIRECT pread  │     │  SPI-mode SD/SDHC/SDXC   │
-│  /dev/loop0      │     │  (embedded targets)      │
-└──────────────────┘     └──────────────────────────┘
+┌──────────────────┐  ┌──────────────────────────┐  ┌──────────────────┐
+│  Linux Driver    │  │  SD Card Driver          │  │  Mock Driver     │
+│  linux_driver.c  │  │  sd_driver.c             │  │  ram_driver.c    │
+│  O_DIRECT pread  │  │  SPI-mode SD/SDHC/SDXC   │  │  heap-backed     │
+│  /dev/loop0      │  │  (embedded targets)      │  │  (tests only)    │
+└──────────────────┘  └──────────────────────────┘  └──────────────────┘
 ```
 
 ## Layers
@@ -61,7 +61,7 @@ All functions accept `zinf_ctx_t *ctx` as their first argument.
 
 ### 3. Storage Engine (`core/storage/`)
 Core logic for:
-- **Log metadata management** — tracks the last-written sector LBA in a v3 metadata sector with 3 redundant copy slots and monotonic 16-bit version counters
+- **Log metadata management** — tracks the last-written sector LBA in a v4 metadata sector with 3 redundant copy slots and monotonic 16-bit version counters
 - **Sector construction** — assembles header + payload + CRC32 into a full sector
 - **RAID mirroring** — writes each sector to `mirror_count` physical locations separated by `mirror_offset` sectors
 
@@ -75,25 +75,30 @@ Generated from `zinf.yaml` by `tools/zinf_gen.py`. Provides compile-time constan
 ### 6. Driver Layer (`drivers/`)
 Platform-specific block I/O. The `driver` field in `zinf_ctx_t` routes all reads/writes to the correct backend.
 
+| Driver | Path | Use |
+|---|---|---|
+| `linux_driver` | `drivers/linux/` | Host development, CI, benchmark (`O_DIRECT` pread/pwrite) |
+| `sd_driver` | `drivers/sd/` | Embedded MCU targets (SPI-mode SD/SDHC/SDXC) |
+| `ram_driver` | `drivers/mock/` | Unit tests and fuzz engine (malloc'd heap, fault-injectable) |
+| stub | `drivers/embedded/` | Starting template — all functions return errors |
+
 ### 7. Platform Selection (`platform/`)
-Each platform file defines `zinf_ctx` and wires up the driver:
+Each platform file defines the global `zinf_ctx` pointer and wires up the driver. Only one platform file is compiled per build target.
+
+| File | Driver wired | Notes |
+|---|---|---|
+| `platform_linux.c` | `linux_driver` | Used by the CLI and benchmark |
+| `platform_embedded.c` | `sd_driver` | Used by MCU firmware; requires `sd_driver_init_spi()` before `setup_storage()` |
 
 ```c
 // platform_linux.c
 #include "config.h"
 #include "linux_driver.h"
 
-static zinf_ctx_t ctx;
-zinf_ctx_t *zinf_ctx = &ctx;
-
-void platform_init(const char *dev_path) {
-    linux_driver_set_path(dev_path);
-    zinf_ctx_init_defaults(zinf_ctx);
-    zinf_ctx->driver = &linux_driver;
-}
+static zinf_ctx_t g_zinf_ctx;
+zinf_ctx_t *zinf_ctx = &g_zinf_ctx;
+// Caller calls linux_driver_set_path() + zinf_ctx_init_defaults() before setup_storage()
 ```
-
-Only one platform file is compiled per build target.
 
 ---
 
@@ -223,3 +228,5 @@ All state that was previously global is now encapsulated in `zinf_ctx_t`:
 | `mirror_offset` | `uint64_t` | Sector spacing between mirror copies |
 | `log_sector` | `uint64_t` | LBA of the primary metadata sector (default 0) |
 | `raid_offset` | `uint64_t` | Runtime-computed mirror spacing (used by init) |
+| `bad_sectors[]` | `uint64_t[MAX_BAD_SECTORS]` | In-RAM bad-sector blacklist (not persisted; rebuilt by `zinf_scrub()`) |
+| `bad_sector_count` | `uint8_t` | Number of entries currently in `bad_sectors[]` |

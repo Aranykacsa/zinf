@@ -6,29 +6,35 @@ This document is derived from the thesis *"Mérésadatgyűjtésre optimalizált 
 
 ## Current Status Summary
 
-The MVP (as defined in the thesis, Chapter 6) is complete:
-
 | Feature | Status |
 |---|---|
 | RAID-1 mirroring (2 mirrors) | Done |
 | CRC-32 per-sector integrity | Done |
 | Append-only / CoW data blocks | Done |
-| Metadata block (alpha + omega sectors) | Done |
+| Metadata block (format v4 — magic + 3 copy slots + monotonic versioning) | Done |
 | Driver abstraction layer (`driver_t`) | Done |
 | Linux loopback driver | Done |
-| Config system (`config.c/h`) | Done |
-| CLI + benchmark tooling | Done |
+| SD card driver (SPI, SD/SDHC/SDXC) | Done |
+| Mock / RAM driver for tests and fuzz | Done |
+| Config system (`config.c/h`, YAML codegen) | Done |
+| CLI (`zinf format`, `zinf info`, `zinf bench`, `zinf shell`) | Done |
+| Install system (`sudo make install`, udev, `zinf-probe`) | Done |
+| Configurable mirror count (M mirrors, majority voting) | Done |
+| 64-bit sector addressing | Done |
+| RAID read path with CRC verification + fallback + majority voting | Done |
+| Bad-sector blacklist (`zinf_mark_bad_sector`, `zinf_scrub`) | Done |
+| Automated fault-injection test suite (28 unit + 172 CSV scenarios) | Done |
 | First real deployment (Mimike-II Rev-I CanSat) | Done |
 
 ---
 
 ## Part 1 — Refactors (Fix What Exists)
 
-These address correctness gaps and technical debt identified in the thesis and current code.
+All Part 1 refactors are complete.
 
 ---
 
-### R1 — Encapsulate global state into a context struct
+### R1 — Encapsulate global state into a context struct ✓ Done
 
 **Problem:** `RAID_OFFSET`, `log_sector`, `active_driver`, `config` are process-wide globals. This makes multi-instance use impossible and unit testing difficult.
 
@@ -48,7 +54,7 @@ Pass `zinf_ctx_t *` to all API and storage functions instead of reading globals.
 
 ---
 
-### R2 — Fix sector addressing width (24-bit → 32-bit)
+### R2 — Fix sector addressing width ✓ Done (upgraded to 64-bit, format v4)
 
 **Problem:** `log_get_last_sector` / `log_set_last_sector` encode the sector index as a 24-bit little-endian value in the metadata sector (bytes 0–2). The thesis notes 32-bit addressing is sufficient for current use (max 2 TB) and is already planned for upgrade.
 
@@ -58,7 +64,7 @@ Pass `zinf_ctx_t *` to all API and storage functions instead of reading globals.
 
 ---
 
-### R3 — Harden the last-sector pointer (redundant copies + versioning)
+### R3 — Harden the last-sector pointer ✓ Done (3 copy slots, monotonic 16-bit version counters)
 
 **Problem (thesis §9.11):** The last-written sector index is stored only once, at the start of the metadata sector. A power-loss during that write leaves the pointer corrupted with no way to recover it without scanning all sectors.
 
@@ -74,7 +80,7 @@ Pass `zinf_ctx_t *` to all API and storage functions instead of reading globals.
 
 ---
 
-### R4 — Add CRC verification to the read path
+### R4 — Add CRC verification to the read path ✓ Done
 
 **Problem:** `read_sector()` is a raw pass-through — it does not verify the stored CRC-32. The CRC check only happens in the external reader tool, not in the library itself.
 
@@ -91,7 +97,7 @@ Keep `read_sector()` as the raw low-level primitive.
 
 ---
 
-### R5 — Remove hardcoded device path from Linux driver
+### R5 — Remove hardcoded device path from Linux driver ✓ Done
 
 **Problem:** `/dev/loop0` is hardcoded in `linux_driver.c` inside the `linux_ctx_t` initializer. Any different device requires a recompile.
 
@@ -101,7 +107,7 @@ Keep `read_sector()` as the raw low-level primitive.
 
 ---
 
-### R6 — Normalize message log capacity calculation
+### R6 — Normalize message log capacity calculation ✓ Done
 
 **Problem:** `save_msg()` has magic constants for the two-sector message log layout (506 bytes in sector 0 after the 6-byte header, 516 bytes in sector 1). These are not derived from the configurable constants and will silently break if `SECTOR_SIZE` or the header layout changes.
 
@@ -120,11 +126,9 @@ Keep `read_sector()` as the raw low-level primitive.
 
 ## Part 2 — New Features (Thesis §6 and §8)
 
-Features described in the thesis as planned but not yet implemented.
-
 ---
 
-### F1 — Configurable mirror count (M mirrors, majority voting)
+### F1 — Configurable mirror count (M mirrors, majority voting) ✓ Done
 
 **Thesis reference:** §8.1.1, §9.10
 
@@ -141,7 +145,7 @@ Features described in the thesis as planned but not yet implemented.
 
 ---
 
-### F2 — YAML-based configuration
+### F2 — YAML-based configuration ✓ Done
 
 **Thesis reference:** §8.1.2, §9.9
 
@@ -179,7 +183,7 @@ The Makefile runs the generator before compilation if the YAML is newer than the
 
 ---
 
-### F3 — Desktop GUI (Tauri + Svelte)
+### F3 — Desktop GUI (Tauri + Svelte) — In Progress
 
 **Thesis reference:** §8.3
 
@@ -233,7 +237,7 @@ Currently the metadata block is always exactly 2 sectors (alpha + omega = 1024 b
 
 ---
 
-### F5 — 64-bit sector addressing
+### F5 — 64-bit sector addressing ✓ Done
 
 **Thesis reference:** §8.1.2
 
@@ -249,7 +253,7 @@ The thesis notes that 32-bit addressing (max ~2 TB at 512 B/sector) is sufficien
 
 ---
 
-### F6 — SD card driver (re-implementation)
+### F6 — SD card driver (re-implementation) ✓ Done
 
 **Thesis reference:** §9.1, §9.8
 
@@ -272,7 +276,7 @@ Detection at `init` time via CMD58 (OCR register).
 
 ---
 
-### F7 — Automated fault-injection test suite
+### F7 — Automated fault-injection test suite ✓ Done
 
 **Thesis reference:** §10.3
 
@@ -321,15 +325,18 @@ These are explicitly listed in the thesis as out of scope (Not-MVP, Chapter 7) b
 
 ## Suggested Implementation Order
 
-| Priority | Item | Reason |
-|---|---|---|
-| 1 | R2 + R3 | On-disk format correctness — power-loss safety gap |
-| 2 | R4 | RAID is incomplete without a reading path that verifies CRC |
-| 3 | R1 | Enables testing; required for F1 and F3 |
-| 4 | R5, R6 | Small cleanups, low risk |
-| 5 | F1 (M=3) | Unlocks majority voting; required for the full fault tolerance model |
-| 6 | F7 | Validates everything above; should gate further features |
-| 7 | F2 (YAML config) | Enables F3; required for the GUI |
-| 8 | F4, F5 | Scalability improvements |
-| 9 | F3 (GUI) | Largest effort; depends on F2 |
-| 10 | F6 (SD driver) | Hardware-specific; depends on R1 for clean driver swap |
+All refactors and Part 1–2 features are complete. Remaining work is tracked in `docs/tasks/`.
+
+| Priority | Item | Status | Reason |
+|---|---|---|---|
+| ~~1~~ | ~~R2 + R3~~ | **Done** | On-disk format v4 with 3 redundant copy slots |
+| ~~2~~ | ~~R4~~ | **Done** | `raid_read` with CRC + fallback + majority voting |
+| ~~3~~ | ~~R1~~ | **Done** | All state in `zinf_ctx_t` |
+| ~~4~~ | ~~R5, R6~~ | **Done** | `linux_driver_set_path`; derived MSG_LOG constants |
+| ~~5~~ | ~~F1~~ | **Done** | Configurable mirror count, majority voting |
+| ~~6~~ | ~~F7~~ | **Done** | 28-test unit suite + 172 CSV fault scenarios |
+| ~~7~~ | ~~F2~~ | **Done** | `zinf.yaml` + `zinf_gen.py` codegen |
+| ~~8~~ | ~~F5~~ | **Done** | `uint64_t` sector addressing throughout |
+| 9 | F3 (ZINF Studio GUI) | Planned | See `docs/tasks/01-zinf-studio-core.md` |
+| ~~10~~ | ~~F6~~ | **Done** | `drivers/sd/sd_driver.c` |
+| — | F4 (configurable metadata sector count) | Pending | Expose `metadata_sectors` in YAML; generalize `save_msg` capacity |

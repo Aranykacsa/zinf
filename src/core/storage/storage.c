@@ -129,6 +129,27 @@ uint8_t log_init_log_sector(zinf_ctx_t *ctx) {
     buf[4] = (uint8_t)(META_FORMAT_VER & 0xFFu);
     buf[5] = (uint8_t)((META_FORMAT_VER >> 8) & 0xFFu);
     /* bytes 6-7: reserved, already zero */
+
+    /* Seed all copy slots to (metadata_sectors - 1) so that base_write_cursor on the
+       first raid write = metadata_sectors, safely past the metadata sector area.
+       Without this the cursor would start at LBA 1 which is the secondary metadata
+       sector — save_msg overflow also targets that LBA and would silently overwrite it. */
+    {
+        uint64_t init_lba = (uint64_t)(meta_sects - 1u);
+        for (uint8_t i = 0; i < META_COPIES; i++) {
+            uint16_t off = (uint16_t)(META_COPY_SLOT_BASE + i * (uint16_t)META_COPY_STRIDE);
+            buf[off + 0] = (uint8_t)(init_lba        & 0xFFu);
+            buf[off + 1] = (uint8_t)((init_lba >>  8) & 0xFFu);
+            buf[off + 2] = (uint8_t)((init_lba >> 16) & 0xFFu);
+            buf[off + 3] = (uint8_t)((init_lba >> 24) & 0xFFu);
+            buf[off + 4] = (uint8_t)((init_lba >> 32) & 0xFFu);
+            buf[off + 5] = (uint8_t)((init_lba >> 40) & 0xFFu);
+            buf[off + 6] = (uint8_t)((init_lba >> 48) & 0xFFu);
+            buf[off + 7] = (uint8_t)((init_lba >> 56) & 0xFFu);
+            /* version = 0 — all slots equally fresh at init */
+        }
+    }
+
     if (ctx_write_sector(ctx, ctx->log_sector, buf) != DRIVER_OK)
         return STORAGE_ERR_DRIVER;
 
@@ -159,6 +180,25 @@ uint8_t log_raid_u8bit_values(zinf_ctx_t *ctx, uint8_t *buffer, size_t len, uint
     if (num_chunks == 0u) return STORAGE_OK;
 
     uint64_t base_write_cursor = last_log_index + 1u;
+
+    /* ---- bounds check -------------------------------------------------- */
+    /* Guard 1: mirror-0 must not cross into mirror-1's address space.
+       Mirror-0 data occupies [metadata_sectors, metadata_sectors + mirror_offset - 1].
+       base_write_cursor starts at metadata_sectors after a clean init. */
+    if (ctx->mirror_count > 1u && ctx->mirror_offset > 0u) {
+        uint64_t last_m0    = base_write_cursor + (uint64_t)(num_chunks - 1u);
+        uint64_t m0_ceiling = (uint64_t)ctx->metadata_sectors + ctx->mirror_offset;
+        if (last_m0 >= m0_ceiling)
+            return STORAGE_ERR_FULL;
+    }
+    /* Guard 2: last sector of the furthest mirror must fit within the device. */
+    if (ctx->driver->total_sectors > 0u) {
+        uint64_t last_phys = base_write_cursor + (uint64_t)(num_chunks - 1u)
+                           + (uint64_t)(ctx->mirror_count - 1u) * ctx->mirror_offset;
+        if (last_phys >= ctx->driver->total_sectors)
+            return STORAGE_ERR_FULL;
+    }
+    /* -------------------------------------------------------------------- */
 
     size_t   total_size  = (size_t)num_chunks * ctx->sector_size;
     uint8_t *bulk_buffer = (uint8_t *)malloc(total_size);

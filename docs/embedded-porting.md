@@ -238,7 +238,7 @@ int main(void) {
 }
 ```
 
-**Pre-formatted cards:** If you ran `zinf_cli -d /dev/sdb storage init && zinf_cli -d /dev/sdb log init` on your Linux machine before inserting the card, skip steps 4 and 5 — the metadata is already in place. The MCU can start writing immediately after steps 1–3.
+**Pre-formatted cards:** If you ran `sudo zinf format /dev/sdb` on your Linux machine before inserting the card, skip steps 4 and 5 — the metadata is already in place. The MCU can start writing immediately after steps 1–3.
 
 ---
 

@@ -62,7 +62,7 @@ sudo dnf install libxlsxwriter-devel   # Fedora
 
 ---
 
-## 4. Interactive CLI (needs a loop device)
+## 3. Interactive CLI (needs a loop device)
 
 ```bash
 # Create a 10 MB test image and attach it
@@ -87,7 +87,7 @@ Then type commands:
 
 ---
 
-## 5. Benchmark
+## 4. Benchmark
 
 ```bash
 sudo zinf bench /dev/loop0
@@ -97,7 +97,7 @@ Outputs a CSV of throughput and latency across different chunk sizes.
 
 ---
 
-## 6. Image inspection (no sudo)
+## 5. Image inspection (no sudo)
 
 ```bash
 zinf info /tmp/test.img
@@ -107,7 +107,7 @@ Shows sector geometry and computed RAID offset for any image file.
 
 ---
 
-## 7. YAML codegen
+## 6. YAML codegen
 
 ```bash
 # Edit zinf.yaml (change mirror_count, add data types, etc.)
@@ -128,3 +128,13 @@ cd src && make
 sudo losetup -d /dev/loop0
 rm /tmp/test.img
 ```
+
+## 7. User testing
+
+See [`05-user-testing-protocol.md`](../tasks/05-user-testing-protocol.md) for the full protocol.
+
+### Researchers
+At least 3 researchers must participate. Each reads measurement data from a ZINF-formatted device and exports it to CSV using ZINF Studio.
+
+### Developers
+At least 3 developers must participate. Each integrates ZINF into a predefined reference project from scratch.

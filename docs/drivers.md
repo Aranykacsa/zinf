@@ -100,7 +100,6 @@ Change the device path before calling `init`. Useful in tests to redirect the dr
    `O_DIRECT` bypasses the page cache for deterministic, cache-free I/O.
 3. Queries total device size with the `BLKGETSIZE64` ioctl (block devices only;  
    for regular files this ioctl fails, `total_sectors` is set to 0).
-4. Logs to `stderr`: `[linux_driver] RAW open <path> (fd=N, sectors=M)`.
 
 **Returns:** `DRIVER_OK` or `DRIVER_ERR_INIT`
 
@@ -145,14 +144,16 @@ SPI-mode SD driver for embedded targets. Supports SD (v1), SDHC, and SDXC cards.
 
 ### SPI Operations Interface
 
-The driver is hardware-agnostic. Callers provide a `sd_spi_ops_t` with platform-specific callbacks:
+The driver is hardware-agnostic. Callers provide a `sd_spi_ops_t` with platform-specific callbacks. The opaque `spi_handle_t` pointer is passed through to every callback so a single callback set can serve multiple SPI peripherals without globals.
 
 ```c
-typedef struct {
-    void (*cs_set)(int assert);              /* chip-select: 1=assert, 0=deassert */
-    uint8_t (*xfer)(uint8_t byte);           /* SPI transfer: send byte, return received byte */
-    void (*tx_buf)(const uint8_t *b, size_t n);  /* optional bulk TX (NULL = use xfer) */
-    void (*rx_buf)(uint8_t *b, size_t n);        /* optional bulk RX (NULL = use xfer) */
+typedef void *spi_handle_t;
+
+typedef struct sd_spi_ops_t {
+    void    (*cs_set)(spi_handle_t h, int active);          /* chip-select: active=1 asserts CS */
+    uint8_t (*xfer)  (spi_handle_t h, uint8_t tx);          /* full-duplex byte transfer */
+    void    (*tx_buf)(spi_handle_t h, const uint8_t *b, size_t n);  /* optional bulk TX */
+    void    (*rx_buf)(spi_handle_t h, uint8_t *b, size_t n);        /* optional bulk RX */
 } sd_spi_ops_t;
 ```
 
@@ -233,6 +234,57 @@ zinf_ctx->driver->init(zinf_ctx->driver);
 ```
 
 See [Embedded Porting Guide](embedded-porting.md) for the complete RP2350 wiring and first-boot initialization pattern.
+
+---
+
+## Mock / RAM Driver (`drivers/mock/ram_driver.c`)
+
+An in-memory block device backed by a `malloc`'d heap buffer. Used exclusively by the test suite and fuzz engine — never compiled into production builds.
+
+### Global Instance
+
+```c
+extern driver_t ram_driver;
+```
+
+### Configuration Functions
+
+```c
+void ram_driver_set_capacity(uint64_t sectors);
+```
+
+Set the number of sectors (default: 65536 = 32 MB). Call before `init`.
+
+```c
+void ram_driver_corrupt(uint64_t lba, uint32_t offset, uint8_t val);
+```
+
+Directly overwrite one byte in the backing buffer at `lba * sector_size + offset`. Used for fault injection — simulates bitflips, torn writes, and zero-fill without going through the driver interface.
+
+```c
+void ram_driver_drop_buffer(void);
+```
+
+Wipe the entire backing buffer to zeros. Simulates a power-loss / cold-boot state for testing recovery sequences.
+
+### Characteristics
+
+| Property | Value |
+|---|---|
+| `name` | `"ram_mock"` |
+| `sector_size` | 512 |
+| `total_sectors` | 65536 (default) |
+| I/O method | `memcpy` |
+| `read_blocks` / `write_blocks` | Not implemented (NULL) |
+| `sync` | No-op (NULL) |
+
+The RAM driver supports `read_block` and `write_block` only. Returns `DRIVER_ERR_IO` for out-of-bounds LBA accesses.
+
+---
+
+## Embedded Stub (`drivers/embedded/embedded_driver.c`)
+
+A compilable placeholder for new embedded targets. All functions return `DRIVER_ERR_INIT` or `DRIVER_ERR_IO`. Copy this file as a starting point when adding a new platform driver — the `driver_t` initializer, struct layout, and function signatures are all correct.
 
 ---
 

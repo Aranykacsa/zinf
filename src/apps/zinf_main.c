@@ -13,6 +13,7 @@
 #include "api.h"
 #include "config.h"
 #include "linux_driver.h"
+#include "ram_driver.h"
 
 /* Forward declaration — zinf_ctx is defined in platform_linux.c */
 extern zinf_ctx_t *zinf_ctx;
@@ -20,6 +21,8 @@ extern driver_t    linux_driver;
 
 /* Active device path — overridden by -d <device> */
 static const char *g_device = "/dev/loop0";
+
+#define CSV_IMG_SECTS 4096u
 
 /* =========================================================
    CLI
@@ -191,25 +194,28 @@ static void cli_rx_char(char c) {
    ========================================================= */
 
 static void print_usage(const char *argv0) {
-    printf("Usage: %s <command> [device]\n"
+    printf("Usage: %s <command> [device] [options]\n"
            "\n"
            "Commands:\n"
-           "  %s format <device>       Format a device or image as ZINF\n"
-           "  %s info   <device>       Show ZINF partition geometry\n"
-           "  %s bench  [device]       Throughput/latency benchmark (CSV to stdout)\n"
-           "  %s shell  [device]       Interactive command shell\n"
-           "  %s help                  Show this help\n"
+           "  format <device>       Format a device or image as ZINF\n"
+           "  info   <device>       Show ZINF partition geometry\n"
+           "  bench  [device]       Throughput/latency benchmark (CSV to stdout)\n"
+           "  shell  [device]       Interactive command shell\n"
+           "  help                  Show this help\n"
            "\n"
            "Flag:\n"
            "  -d <device>   Equivalent to passing device positionally\n"
            "                (default: /dev/loop0)\n"
+           "  -R            Use RAM mock driver\n"
+           "  --random-payload\n"
+           "  --jitter <us>\n"
+           "  --pre-degraded <count>\n"
            "\n"
            "Examples:\n"
            "  sudo %s format /dev/sdb\n"
            "  %s info /dev/sdb\n"
            "  sudo %s bench /dev/sdb > results.csv\n",
            argv0,
-           argv0, argv0, argv0, argv0, argv0,
            argv0, argv0, argv0);
 }
 
@@ -260,6 +266,8 @@ static int run_reader(const char *img) {
    ========================================================= */
 
 static uint64_t compute_raid_offset(const char *devpath) {
+    if (zinf_ctx->driver == &ram_driver) return (CSV_IMG_SECTS - 2) / zinf_ctx->mirror_count;
+
     int fd = open(devpath, O_RDONLY);
     if (fd < 0) { perror("open"); return 30u; }
 
@@ -275,17 +283,14 @@ static uint64_t compute_raid_offset(const char *devpath) {
                       ? (usable / zinf_ctx->mirror_count) : 30u;
     if (offset < 8u) offset = 8u;
 
-    /* Validate: mirror_count should be odd for majority voting */
-    if (zinf_ctx->mirror_count > 1 && (zinf_ctx->mirror_count % 2u) == 0) {
-        fprintf(stderr, "[WARN] mirror_count=%u is even — majority voting disabled. "
-                        "Consider using an odd number.\n",
-                (unsigned)zinf_ctx->mirror_count);
-    }
-
     return offset;
 }
 
 static void wipe_loop_device(const char *dev) {
+    if (zinf_ctx->driver == &ram_driver) {
+        ram_driver_drop_buffer();
+        return;
+    }
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
              "dd if=/dev/zero of=%s bs=1M count=5 status=none", dev);
@@ -340,7 +345,7 @@ static void sensor_generate(sensor_t *s, uint32_t tick) {
     s->temp = temp; s->humidity = hum;
 }
 
-static int run_benchmark(void) {
+static int run_benchmark(int random_payload, int jitter_us, int pre_degraded) {
     const char *dev = g_device;
     printf("PayloadSize,Throughput_KBps,MaxLatency_us,AvgLatency_us,SectorsWritten\n");
 
@@ -353,6 +358,7 @@ static int run_benchmark(void) {
 
     sensor_t sensors[max_records];
     uint32_t tick = 0;
+    uint32_t rng_seed = (uint32_t)time(NULL);
 
     for (int t = 0; t < NUM_TESTS; t++) {
         int chunks     = CHUNK_COUNTS[t];
@@ -360,21 +366,37 @@ static int run_benchmark(void) {
 
         reset_zinf(dev);
 
+        if (pre_degraded > 0) {
+            for (int i = 0; i < pre_degraded; i++) {
+                uint64_t bad_lba = (xs32(&rng_seed) % (CSV_IMG_SECTS - 2)) + 2;
+                zinf_mark_bad_sector(zinf_ctx, bad_lba);
+            }
+        }
+
         uint64_t max_lat = 0, total_lat = 0;
         int ops = 0, total_bytes = 0;
         uint64_t t_start = get_time_ns();
 
         while (total_bytes < TARGET_TOTAL_BYTES) {
+            int current_chunks = random_payload ? (int)(xs32(&rng_seed) % chunks + 1) : chunks;
+            
             uint64_t t0 = get_time_ns();
-            for (int i = 0; i < chunks; i++) {
+            for (int i = 0; i < current_chunks; i++) {
                 for (int k = 0; k < max_records; k++) sensor_generate(&sensors[k], tick++);
                 uint8_t rc = raid_sensor_values(zinf_ctx, sensors, (size_t)max_records);
-                if (rc != STORAGE_OK) { fprintf(stderr, "write error rc=%u\n", rc); return 1; }
+                if (rc != STORAGE_OK && rc != STORAGE_WARN_DEGRADED) { 
+                    fprintf(stderr, "write error rc=%u\n", rc); return 1; 
+                }
             }
             uint64_t dt = get_time_ns() - t0;
             if (dt > max_lat) max_lat = dt;
             total_lat += dt; ops++;
-            total_bytes += write_size;
+            total_bytes += (current_chunks * (int)PAYLOAD_SIZE);
+
+            if (jitter_us > 0) {
+                struct timespec ts = {0, (long)(xs32(&rng_seed) % jitter_us) * 1000};
+                nanosleep(&ts, NULL);
+            }
         }
 
         double dur = (get_time_ns() - t_start) / 1e9;
@@ -384,11 +406,6 @@ static int run_benchmark(void) {
                max_lat / 1000.0,
                (total_lat / (double)ops) / 1000.0,
                chunks);
-        fprintf(stderr, "Chunks:%4d (%6dB) Speed:%8.2fKB/s MaxLat:%8.2fus AvgLat:%8.2fus\n",
-                chunks, write_size,
-                (total_bytes / 1024.0) / dur,
-                max_lat / 1000.0,
-                (total_lat / (double)ops) / 1000.0);
     }
     return 0;
 }
@@ -399,7 +416,6 @@ static int run_benchmark(void) {
 
 static int run_format(const char *dev) {
     printf("Formatting %s as ZINF v%u...\n", dev, (unsigned)META_FORMAT_VER);
-    zinf_ctx->driver      = &linux_driver;
     zinf_ctx->raid_offset = compute_raid_offset(dev);
     uint8_t rc = setup_storage(zinf_ctx);
     if (rc != STORAGE_OK) {
@@ -420,7 +436,6 @@ static int run_format(const char *dev) {
    ========================================================= */
 
 static void cli_init_storage(void) {
-    zinf_ctx->driver      = &linux_driver;
     zinf_ctx->raid_offset = compute_raid_offset(g_device);
     if (setup_storage(zinf_ctx) != STORAGE_OK) {
         fprintf(stderr, "setup_storage failed (need sudo?)\n"); exit(1);
@@ -449,42 +464,54 @@ static int run_cli_one_shot(int argc, char **argv, int start) {
    ========================================================= */
 
 int main(int argc, char **argv) {
-    /* Parse optional -d <device> before the mode argument */
-    int arg_start = 1;
-    if (argc >= 3 && strcmp(argv[1], "-d") == 0) {
-        g_device   = argv[2];
-        arg_start  = 3;
+    int random_payload = 0;
+    int jitter_us = 0;
+    int pre_degraded = 0;
+    int use_ram = 0;
+    int mode_idx = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            g_device = argv[++i];
+        } else if (strcmp(argv[i], "--random-payload") == 0) {
+            random_payload = 1;
+        } else if (strcmp(argv[i], "--jitter") == 0 && i + 1 < argc) {
+            jitter_us = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--pre-degraded") == 0 && i + 1 < argc) {
+            pre_degraded = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-R") == 0) {
+            use_ram = 1;
+        } else if (mode_idx == -1) {
+            mode_idx = i;
+        }
     }
 
-    /* Wire up the Linux driver and point it at the selected device */
-    linux_driver_set_path(g_device);
-    zinf_ctx->driver = &linux_driver;
+    if (use_ram) {
+        ram_driver_set_capacity(CSV_IMG_SECTS);
+        zinf_ctx->driver = &ram_driver;
+    } else {
+        linux_driver_set_path(g_device);
+        zinf_ctx->driver = &linux_driver;
+    }
 
-    if (argc < arg_start + 1) { print_usage(argv[0]); return 0; }
+    if (mode_idx == -1) { print_usage(argv[0]); return 0; }
 
-    const char *mode = argv[arg_start];
-    if (strcmp(mode, "help") == 0 || strcmp(mode, "--help") == 0)
-        { print_usage(argv[0]); return 0; }
-
-    /* format: zinf format <device>  OR  zinf -d <device> format */
+    const char *mode = argv[mode_idx];
+    if (strcmp(mode, "bench") == 0) return run_benchmark(random_payload, jitter_us, pre_degraded);
     if (strcmp(mode, "format") == 0) {
-        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
-        linux_driver_set_path(dev);
+        const char *dev = (argc > mode_idx + 1) ? argv[mode_idx + 1] : g_device;
         return run_format(dev);
     }
-
-    /* info: zinf info <device>  OR  zinf -d <device> info */
     if (strcmp(mode, "info") == 0) {
-        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
+        const char *dev = (argc > mode_idx + 1) ? argv[mode_idx + 1] : g_device;
         return run_reader(dev);
     }
-
-    if (strcmp(mode, "bench") == 0) return run_benchmark();
     if (strcmp(mode, "shell") == 0 || strcmp(mode, "cli") == 0)
         return run_cli_interactive();
-    if (strcmp(mode, "read")  == 0) {
-        const char *dev = (argc > arg_start + 1) ? argv[arg_start + 1] : g_device;
-        return run_reader(dev);
+    if (strcmp(mode, "help") == 0 || strcmp(mode, "--help") == 0) {
+        print_usage(argv[0]);
+        return 0;
     }
-    return run_cli_one_shot(argc, argv, arg_start);
+
+    return run_cli_one_shot(argc, argv, mode_idx);
 }

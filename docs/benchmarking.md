@@ -8,7 +8,29 @@ sudo zinf bench /dev/sdb
 
 # Save results
 sudo zinf bench /dev/sdb > results.csv
+
+# Use RAM mock driver (no device needed)
+zinf -R bench
+
+# Randomized payload sizes (normal distribution instead of fixed steps)
+sudo zinf bench /dev/sdb --random-payload
+
+# Add jitter between writes (simulates scheduling noise)
+sudo zinf bench /dev/sdb --jitter 500   # 500 µs max random sleep
+
+# Pre-degrade N sectors before timing starts
+sudo zinf bench /dev/sdb --pre-degraded 32
 ```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `-d <device>` | Block device path (default `/dev/loop0`) |
+| `-R` | Use the in-memory RAM mock driver (no block device needed) |
+| `--random-payload` | Randomize write chunk counts (normal distribution) instead of the fixed step list |
+| `--jitter <us>` | Inject a random `nanosleep()` up to `<us>` microseconds between each write call |
+| `--pre-degraded <count>` | Blacklist `<count>` random sectors before the timing loop starts |
 
 The benchmark automatically:
 1. Wipes the device with `dd`
@@ -137,15 +159,3 @@ Latency is per `raid_sensor_values()` call and includes:
 
 On a loopback device (RAM-backed), throughput is typically in the 50–500 MB/s range depending on kernel version and RAM speed.
 
----
-
-## Test CSV Files
-
-Historical benchmark results are stored in `tests/*.csv`. Corresponding visualization scripts (`tests/*.py`) generate the PNG charts also in that directory.
-
-To regenerate charts:
-
-```bash
-cd tests
-python3 plot_results.py results.csv   # adjust script name as needed
-```

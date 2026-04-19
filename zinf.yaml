@@ -7,7 +7,7 @@ zinf:
   mirror_count: 2         # RAID mirror count (must be odd for majority voting; 1 disables RAID)
   header_size: 1          # per-sector header bytes (type tag)
   metadata_sectors: 2     # sectors reserved for metadata (sector 0 + overflow sector)
-  max_bad_sectors: 16     # bad-sector blacklist capacity in zinf_ctx_t (RAM only)
+  max_bad_sectors: 64     # bad-sector blacklist capacity in zinf_ctx_t (RAM only); 64×8=512 bytes
 
   data_types:
     - name: sensor_t

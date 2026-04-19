@@ -21,10 +21,11 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 | [Drivers](drivers.md) | `driver_t` interface and platform implementations |
 | [Configuration](configuration.md) | Constants, structs, and runtime settings |
 | [Benchmarking](benchmarking.md) | Running the benchmark and interpreting results |
-| [Fault Testing](fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
-| [Fuzz Analysis](fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
-| [Realistic Lifecycle Test](realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
-| [Advanced Test Suite](advanced-test.md) | 7 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O |
+| [Testing Overview](testing/test.md) | All test suites at a glance — unit tests, fault injection, CLI, benchmark |
+| [Fault Testing](testing/fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
+| [Fuzz Analysis](testing/fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
+| [Realistic Lifecycle Test](testing/realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
+| [Advanced Test Suite](testing/advanced-test.md) | 8 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O, repair cycle |
 | [Embedded Porting Guide](embedded-porting.md) | SPI wiring, CMakeLists.txt, and first-boot init for RP2350/Pico |
 
 ## Repository Layout

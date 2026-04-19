@@ -8,6 +8,7 @@ This roadmap details the architectural pivot to a **Boxed Appliance Model**, exp
 1. **ZINF Studio (Tauri App) & 1-Click Install:** A streamlined Linux-first desktop GUI (with future Windows/macOS support) for zero-code configuration, extraction, and seamless updates.
 2. **Config-Injected Firmware (For Standard Users):** Eliminating MCU compilation steps for standard hardware by patching pre-compiled binaries via the GUI.
 3. **Guided Integration SDK (For Developers):** A heavily scaffolded, hand-holding wizard for users who *do* need to integrate ZINF into their custom hardware codebases and compile it themselves.
+4. **Massive-Scale Randomized Testing:** Scaling the reliability suite to 1,000,000+ iterations using a dual-path (RAM + Loopback) fuzzer to prove bulletproof durability.
 
 ---
 
@@ -112,3 +113,21 @@ If an SD card becomes unreadable, ZINF Studio provides a "Factory Reset" flow:
 
 ### 4.2 The `.zinf_project` Archive
 ZINF Studio stores all configurations (`zinf.yaml`), custom `.c` drivers, and Makefiles in a single compressed `.zinf_project` archive. This makes it trivial to version control the setup, share it with other researchers, and instantly restore the environment on a new machine.
+
+---
+
+## 5. Massive-Scale Reliability & Randomized Benchmarking
+
+To ensure the "Boxed Appliance" is bulletproof, we are scaling our testing infrastructure.
+
+### 5.1 Dual-Path Fuzzing (RAM + Hardware)
+We will implement an **In-Memory RAM Driver** that executes 1,000,000+ logical fault tests (SEU, metadata corruption) per minute. Parallel to this, we will run hardware-accurate tests via the Linux loopback driver to verify POSIX block guarantees.
+
+### 5.2 Deep State Machine Fuzzing
+Tests will no longer be single-shot. The fuzzer will simulate years of field attrition by randomly chaining:
+*   Interleaved writes and scrubs.
+*   Power-loss simulations (instant buffer drops).
+*   Targeted metadata attrition (zeroing copy slots, forcing version wraparounds).
+
+### 5.3 Real-World Randomized Benchmarking
+`zinf bench` will be updated to use randomized payload sizes and injected timing jitter, providing researchers with throughput and latency metrics that match their actual sensor sampling rates.

@@ -80,15 +80,15 @@ static void test_fault_single_mirror_bitflip(void) {
     uint8_t rc = raid_sensor_values(&g_fault_ctx, &s, 1);
     ASSERT_EQ(rc, STORAGE_OK);
 
-    /* Data sector for mirror 0 is at logical sector 1 */
-    uint32_t mirror0_lba = 1u;
+    /* Data sector for mirror 0 is at logical sector 2 */
+    uint32_t mirror0_lba = 2u;
     /* Corrupt payload byte 2 — this invalidates the CRC */
     int corrupt_rc = corrupt_sector_bytes(mirror0_lba, 2, 1);
     ASSERT_EQ(corrupt_rc, 0);
 
     /* raid_read should still succeed via mirror 1 */
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_fault_ctx, 1u, payload);
+    rc = raid_read(&g_fault_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_OK);
 
     fault_teardown();
@@ -106,12 +106,12 @@ static void test_fault_torn_write(void) {
     uint8_t rc = raid_sensor_values(&g_fault_ctx, &s, 1);
     ASSERT_EQ(rc, STORAGE_OK);
 
-    /* Zero the second half of sector 1 (mirror 0) → CRC mismatch */
-    int corrupt_rc = corrupt_sector_bytes(1u, SECTOR_SIZE / 2u, SECTOR_SIZE / 2u);
+    /* Zero the second half of sector 2 (mirror 0) → CRC mismatch */
+    int corrupt_rc = corrupt_sector_bytes(2u, SECTOR_SIZE / 2u, SECTOR_SIZE / 2u);
     ASSERT_EQ(corrupt_rc, 0);
 
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_fault_ctx, 1u, payload);
+    rc = raid_read(&g_fault_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_OK);  /* mirror 1 should be intact */
 
     fault_teardown();
@@ -129,15 +129,15 @@ static void test_fault_all_mirrors_bad(void) {
     uint8_t rc = raid_sensor_values(&g_fault_ctx, &s, 1);
     ASSERT_EQ(rc, STORAGE_OK);
 
-    /* Corrupt both mirrors at sector 1 */
-    uint32_t mirror0_lba = 1u;
-    uint32_t mirror1_lba = 1u + g_fault_ctx.mirror_offset;
+    /* Corrupt both mirrors at sector 2 */
+    uint32_t mirror0_lba = 2u;
+    uint32_t mirror1_lba = 2u + g_fault_ctx.mirror_offset;
 
     ASSERT_EQ(corrupt_sector_bytes(mirror0_lba, 2, 4), 0);
     ASSERT_EQ(corrupt_sector_bytes(mirror1_lba, 2, 4), 0);
 
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_fault_ctx, 1u, payload);
+    rc = raid_read(&g_fault_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_ERR_UNRECOVERABLE);
 
     fault_teardown();
@@ -156,10 +156,10 @@ static void test_fault_majority_voting(void) {
     ASSERT_EQ(rc, STORAGE_OK);
 
     /* Corrupt only mirror 0 */
-    ASSERT_EQ(corrupt_sector_bytes(1u, 2, 4), 0);
+    ASSERT_EQ(corrupt_sector_bytes(2u, 2, 4), 0);
 
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_fault_ctx, 1u, payload);
+    rc = raid_read(&g_fault_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_OK);  /* mirrors 1 and 2 have majority */
 
     fault_teardown();
@@ -266,7 +266,7 @@ static void test_check_sector_all_ok(void) {
     ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
     zinf_sector_health_t h;
-    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 1u, &h), STORAGE_OK);
+    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 2u, &h), STORAGE_OK);
     ASSERT_EQ(h.valid_count, 2u);
     ASSERT_EQ(h.status[0], ZINF_MIRROR_OK);
     ASSERT_EQ(h.status[1], ZINF_MIRROR_OK);
@@ -285,10 +285,10 @@ static void test_check_sector_one_corrupt(void) {
     sensor_t s = { .temp = 20.0f, .humidity = 60.0f };
     ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
-    ASSERT_EQ(corrupt_sector_bytes(1u, 2u, 4u), 0);
+    ASSERT_EQ(corrupt_sector_bytes(2u, 2u, 4u), 0);
 
     zinf_sector_health_t h;
-    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 1u, &h), STORAGE_OK);
+    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 2u, &h), STORAGE_OK);
     ASSERT_EQ(h.valid_count, 1u);
     ASSERT_EQ(h.status[0], ZINF_MIRROR_CRC_FAIL);
     ASSERT_EQ(h.status[1], ZINF_MIRROR_OK);
@@ -307,11 +307,11 @@ static void test_check_sector_blacklisted_mirror(void) {
     sensor_t s = { .temp = 30.0f, .humidity = 70.0f };
     ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
-    /* Mirror 0 physical LBA = logical 1 + 0 * mirror_offset = 1 */
-    ASSERT_EQ(zinf_mark_bad_sector(&g_fault_ctx, 1u), STORAGE_OK);
+    /* Mirror 0 physical LBA = 2 + 0 * mirror_offset = 2 */
+    ASSERT_EQ(zinf_mark_bad_sector(&g_fault_ctx, 2u), STORAGE_OK);
 
     zinf_sector_health_t h;
-    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 1u, &h), STORAGE_OK);
+    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 2u, &h), STORAGE_OK);
     ASSERT_EQ(h.status[0], ZINF_MIRROR_BLACKLIST);
     ASSERT_EQ(h.status[1], ZINF_MIRROR_OK);
     ASSERT_EQ(h.valid_count, 1u);
@@ -334,18 +334,18 @@ static void test_recover_repairs_bad_mirror(void) {
     sensor_t s = { .temp = 5.0f, .humidity = 40.0f };
     ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
-    ASSERT_EQ(corrupt_sector_bytes(1u, 2u, 4u), 0);
+    ASSERT_EQ(corrupt_sector_bytes(2u, 2u, 4u), 0);
 
     /* Confirm mirror 0 is bad */
     zinf_sector_health_t before;
-    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 1u, &before), STORAGE_OK);
+    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 2u, &before), STORAGE_OK);
     ASSERT_EQ(before.status[0], ZINF_MIRROR_CRC_FAIL);
 
-    ASSERT_EQ(zinf_recover_sector(&g_fault_ctx, 1u), STORAGE_OK);
+    ASSERT_EQ(zinf_recover_sector(&g_fault_ctx, 2u), STORAGE_OK);
 
     /* Both mirrors should now pass CRC */
     zinf_sector_health_t after;
-    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 1u, &after), STORAGE_OK);
+    ASSERT_EQ(zinf_check_sector(&g_fault_ctx, 2u, &after), STORAGE_OK);
     ASSERT_EQ(after.valid_count, 2u);
     ASSERT_EQ(after.status[0], ZINF_MIRROR_OK);
     ASSERT_EQ(after.status[1], ZINF_MIRROR_OK);
@@ -365,12 +365,12 @@ static void test_recover_unrecoverable(void) {
     sensor_t s = { .temp = 3.0f, .humidity = 20.0f };
     ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
-    uint64_t mirror0_lba = 1u;
-    uint64_t mirror1_lba = 1u + g_fault_ctx.mirror_offset;
+    uint64_t mirror0_lba = 2u;
+    uint64_t mirror1_lba = 2u + g_fault_ctx.mirror_offset;
     ASSERT_EQ(corrupt_sector_bytes((uint32_t)mirror0_lba, 2u, 4u), 0);
     ASSERT_EQ(corrupt_sector_bytes((uint32_t)mirror1_lba, 2u, 4u), 0);
 
-    ASSERT_EQ(zinf_recover_sector(&g_fault_ctx, 1u), STORAGE_ERR_UNRECOVERABLE);
+    ASSERT_EQ(zinf_recover_sector(&g_fault_ctx, 2u), STORAGE_ERR_UNRECOVERABLE);
 
     /* Both LBAs must now be blacklisted */
     ASSERT_EQ(zinf_is_bad_sector(&g_fault_ctx, mirror0_lba), true);
@@ -392,8 +392,8 @@ static void test_write_skips_blacklisted_mirror(void) {
     int setup_rc = fault_setup(2);
     ASSERT_EQ(setup_rc, 0);
 
-    /* Mirror 0 for logical sector 1 is physical LBA 1 */
-    uint64_t mirror0_lba = 1u;
+    /* Mirror 0 for logical sector 2 is physical LBA 2 */
+    uint64_t mirror0_lba = 2u;
     ASSERT_EQ(zinf_mark_bad_sector(&g_fault_ctx, mirror0_lba), STORAGE_OK);
 
     sensor_t s = { .temp = 99.0f, .humidity = 11.0f };
@@ -410,7 +410,7 @@ static void test_write_skips_blacklisted_mirror(void) {
 
     /* Mirror 1 should have valid CRC */
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_fault_ctx, 1u, payload);
+    rc = raid_read(&g_fault_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_OK);
 
     fault_teardown();
@@ -421,8 +421,8 @@ static void test_write_skips_blacklisted_mirror(void) {
    Scrub test
    ----------------------------------------------------------------------- */
 
-/* 15. Write 4 logical sectors; corrupt mirror 0 in sectors 1 and 3;
-        scrub [1,4]; verify report and that repaired sectors pass CRC */
+/* 15. Write 4 logical sectors; corrupt mirror 0 in sectors 2 and 4;
+        scrub [2,5]; verify report and that repaired sectors pass CRC */
 static void test_scrub_range(void) {
     TEST_BEGIN("scrub_range");
 
@@ -433,13 +433,13 @@ static void test_scrub_range(void) {
     for (int i = 0; i < 4; i++)
         ASSERT_EQ(raid_sensor_values(&g_fault_ctx, &s, 1), STORAGE_OK);
 
-    /* Corrupt mirror 0 of logical sectors 1 and 3
-       (physical mirror 0 LBA = logical sector index since mirror_offset shifts mirror 1) */
-    ASSERT_EQ(corrupt_sector_bytes(1u, 2u, 4u), 0);  /* sector 1, mirror 0 */
-    ASSERT_EQ(corrupt_sector_bytes(3u, 2u, 4u), 0);  /* sector 3, mirror 0 */
+    /* Corrupt mirror 0 of logical sectors 2 and 4
+       (physical mirror 0 LBA = logical sector index; data starts at LBA 2) */
+    ASSERT_EQ(corrupt_sector_bytes(2u, 2u, 4u), 0);  /* sector 2, mirror 0 */
+    ASSERT_EQ(corrupt_sector_bytes(4u, 2u, 4u), 0);  /* sector 4, mirror 0 */
 
     zinf_scrub_report_t report;
-    uint8_t rc = zinf_scrub(&g_fault_ctx, 1u, 4u, &report);
+    uint8_t rc = zinf_scrub(&g_fault_ctx, 2u, 5u, &report);
     ASSERT_EQ(rc, STORAGE_OK);
     ASSERT_EQ(report.checked,       4u);
     ASSERT_EQ(report.repaired,      2u);
@@ -447,7 +447,7 @@ static void test_scrub_range(void) {
     ASSERT_EQ(report.unrecoverable, 0u);
 
     /* All four sectors should now have all mirrors healthy */
-    for (uint64_t logical = 1u; logical <= 4u; logical++) {
+    for (uint64_t logical = 2u; logical <= 5u; logical++) {
         zinf_sector_health_t h;
         ASSERT_EQ(zinf_check_sector(&g_fault_ctx, logical, &h), STORAGE_OK);
         ASSERT_EQ(h.valid_count, 2u);

@@ -28,7 +28,7 @@
 #define MAX_MIRRORS 5u
 
 /* Bad-sector blacklist capacity in zinf_ctx_t (from zinf.yaml max_bad_sectors) */
-#define MAX_BAD_SECTORS 16u
+#define MAX_BAD_SECTORS 64u
 
 /* =========================
    Metadata sector layout (format v4 — magic prefix + 64-bit LBA)
@@ -72,6 +72,8 @@
 #define STORAGE_ERR_UNRECOVERABLE 4u
 /* Non-fatal: write committed to >=1 mirror but fewer than mirror_count */
 #define STORAGE_WARN_DEGRADED     5u
+/* Fatal: write would exceed device capacity or cross the mirror boundary */
+#define STORAGE_ERR_FULL          6u
 
 /* Driver return codes */
 #define DRIVER_OK        0

@@ -114,9 +114,9 @@ static void test_write_read_roundtrip(void) {
     rc = raid_sensor_values(&g_test_ctx, sensors, (size_t)records);
     ASSERT_EQ(rc, STORAGE_OK);
 
-    /* Read back via raid_read on mirror 0 (logical sector 1 — first data sector) */
+    /* Read back via raid_read on mirror 0 (logical sector 2 — first data sector) */
     uint8_t payload[PAYLOAD_SIZE];
-    rc = raid_read(&g_test_ctx, 1u, payload);
+    rc = raid_read(&g_test_ctx, 2u, payload);
     ASSERT_EQ(rc, STORAGE_OK);
 
     /* First 8 bytes encode sensors[0] as 2×float LE */
