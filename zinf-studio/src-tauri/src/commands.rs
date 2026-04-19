@@ -154,6 +154,7 @@ struct ExtractProgress {
 #[derive(Clone, Serialize)]
 pub struct SectorRow {
     pub sector: u64,
+    pub index: usize,
     pub values: Vec<f64>,
 }
 
@@ -195,10 +196,33 @@ pub async fn extract_data(
 
     // Build CSV header
     let header_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-    let csv_header = format!("sector,{}\n", header_names.join(","));
+    let csv_header = format!("sector,index,{}\n", header_names.join(","));
 
-    let mut csv_content = csv_header;
-    let mut rows: Vec<SectorRow> = Vec::with_capacity(last_sector as usize);
+    // Calculate record size
+    let record_size: usize = fields.iter().map(|f| match f.field_type.as_str() {
+        "float" | "f32" | "int32_t" | "i32" | "uint32_t" | "u32" => 4,
+        "double" | "f64" => 8,
+        "int16_t" | "i16" | "uint16_t" | "u16" => 2,
+        _ => 1,
+    }).sum();
+    
+    if record_size == 0 {
+        return Err("Invalid YAML: total record size is zero".into());
+    }
+    let records_per_sector = payload_size / record_size;
+
+    // Open CSV file early to stream writes
+    let mut file = if !output_csv.is_empty() {
+        let mut f = fs::File::create(&output_csv)
+            .map_err(|e| format!("Cannot create CSV: {e}"))?;
+        f.write_all(csv_header.as_bytes())
+            .map_err(|e| format!("Write error: {e}"))?;
+        Some(f)
+    } else {
+        None
+    };
+
+    let mut rows: Vec<SectorRow> = Vec::with_capacity(1000);
     let mut payload = vec![0u8; payload_size];
 
     for sector in 1..=last_sector {
@@ -209,17 +233,35 @@ pub async fn extract_data(
             continue;
         }
 
-        // Deserialise fields (little-endian)
-        let mut values: Vec<f64> = Vec::with_capacity(fields.len());
-        let mut offset = 0usize;
-        for field in &fields {
-            let val = deserialise_field(&payload, &mut offset, &field.field_type);
-            values.push(val);
-        }
+        for i in 0..records_per_sector {
+            let chunk_offset = i * record_size;
+            let chunk = &payload[chunk_offset..chunk_offset + record_size];
 
-        let row_str: Vec<String> = values.iter().map(|v| format!("{v:.4}")).collect();
-        csv_content.push_str(&format!("{},{}\n", sector, row_str.join(",")));
-        rows.push(SectorRow { sector, values });
+            // Skip entirely zeroed chunks (padding)
+            if chunk.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            // Deserialise fields (little-endian)
+            let mut values: Vec<f64> = Vec::with_capacity(fields.len());
+            let mut field_offset = 0usize;
+            for field in &fields {
+                let val = deserialise_field(chunk, &mut field_offset, &field.field_type);
+                values.push(val);
+            }
+
+            // Stream to file
+            if let Some(f) = file.as_mut() {
+                let row_str: Vec<String> = values.iter().map(|v| format!("{v:.4}")).collect();
+                f.write_all(format!("{},{},{}\n", sector, i, row_str.join(",")).as_bytes())
+                    .map_err(|e| format!("Write error: {e}"))?;
+            }
+
+            // Add to UI preview (limit to 1000 rows to prevent frontend freeze)
+            if rows.len() < 1000 {
+                rows.push(SectorRow { sector, index: i, values });
+            }
+        }
 
         if sector % 100 == 0 || sector == last_sector {
             let _ = app.emit("extract-progress", ExtractProgress {
@@ -227,14 +269,6 @@ pub async fn extract_data(
                 total: last_sector,
             });
         }
-    }
-
-    // Write CSV file
-    if !output_csv.is_empty() {
-        let mut file = fs::File::create(&output_csv)
-            .map_err(|e| format!("Cannot create CSV: {e}"))?;
-        file.write_all(csv_content.as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
     }
 
     Ok(rows)

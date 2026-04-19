@@ -15,9 +15,9 @@ Three-panel layout using TailwindCSS:
 ├──────────────┬─────────────────────────────────────────────┤
 │ Devices      │  Sector Data / CSV Preview                  │
 │              │                                             │
-│ /dev/sdb     │  sector | field_0 | field_1 | field_2 ...  │
-│   zinf v4    │  0      | 23.50   | 65.00   | ...          │
-│ /dev/sdc     │  1      | 23.51   | 64.99   | ...          │
+│ /dev/sdb     │  sector | index | field_0 | field_1 ...  │
+│   zinf v4    │  0      | 0     | 23.50   | 65.00   ...  │
+│ /dev/sdc     │  0      | 1     | 23.51   | 64.99   ...  │
 │              │  ...                                        │
 │ [Scan]       │                                             │
 │              │  [Extract to CSV]  [Verify Integrity]       │
@@ -102,10 +102,15 @@ In `build.rs`, use `cargo:rerun-if-changed=../../zinf.yaml` so that any YAML cha
   - Open device, call `setup_storage` FFI to initialize `zinf_ctx_t`.
   - Read `zinf.yaml` from disk (located next to the `zinf-studio` binary, fallback to `../../zinf.yaml`).
   - Parse `data_types[0].fields` to determine column names and types (`float` → `f32`, `int16_t` → `i16`, etc.).
+  - Calculate `record_size` by summing the sizes of all fields.
+  - Calculate `records_per_sector = 507 / record_size`.
   - Iterate logical sectors 1..`last_sector`. For each:
     - Call FFI `raid_read(&mut ctx, sector, payload.as_mut_ptr())`.
-    - Deserialize payload bytes according to field types (LE byte order, matching `sensor_to_wire` in `api.c`).
-    - Write one CSV row.
+    - Iterate `i` in `0..records_per_sector`:
+      - Extract a chunk of `record_size` bytes from `payload` at `i * record_size`.
+      - If the chunk is all zeros (`0x00`), it is empty padding; skip it.
+      - Deserialize chunk bytes according to field types.
+      - Write one CSV row.
   - Emit Tauri event `"extract-progress"` with `{ current: u64, total: u64 }` every 100 sectors.
 - Implement Tauri command `verify_integrity(device_path: String) -> ScrubReport`:
   - Calls FFI `zinf_scrub(&mut ctx, 1, last_sector, &mut report)`.
@@ -124,7 +129,7 @@ data_types:
       - { name: humidity, type: float   }   # 4 bytes LE f32
 ```
 
-Produces CSV header: `sector,temp,humidity`
+Produces CSV header: `sector,index,temp,humidity`
 
 Wire format is the same as `sensor_to_wire()` in `api.c`: each `float` is 4 bytes LE. Future field types must be added to both `sensor_to_wire` and the Rust deserializer together.
 

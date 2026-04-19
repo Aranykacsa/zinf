@@ -6,7 +6,7 @@
 
   // --- Types ---
   interface DeviceInfo { path: string; version: number }
-  interface SectorRow  { sector: number; values: number[] }
+  interface SectorRow  { sector: number; index: number; values: number[] }
   interface ScrubResult { checked: number; healthy: number; repaired: number; unrecoverable: number }
   interface ExtractProgress { current: number; total: number }
 
@@ -202,6 +202,7 @@
                 <thead>
                   <tr class="bg-gray-800 sticky top-0 z-10">
                     <th class="px-3 py-2 text-left text-gray-400 border-b border-gray-700">sector</th>
+                    <th class="px-3 py-2 text-left text-gray-400 border-b border-gray-700">index</th>
                     {#each columnNames as col}
                       <th class="px-3 py-2 text-left text-gray-400 border-b border-gray-700">{col}</th>
                     {/each}
@@ -211,6 +212,7 @@
                   {#each tableRows as row, i}
                     <tr class="border-b border-gray-800 hover:bg-gray-800 {i%2===0?'bg-gray-900':'bg-gray-900/60'}">
                       <td class="px-3 py-1 text-gray-500">{row.sector}</td>
+                      <td class="px-3 py-1 text-gray-500">{row.index}</td>
                       {#each row.values as v}
                         <td class="px-3 py-1 text-amber-300">{v.toFixed(4)}</td>
                       {/each}
