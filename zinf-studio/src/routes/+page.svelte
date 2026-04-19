@@ -25,6 +25,7 @@
   let yamlText   = $state("");
   let yamlSaving = $state(false);
   let yamlSaveMsg = $state("");
+  let extractError = $state("");
   let mirrorCount     = $state(2);
   let sectorSize      = $state(512);
   let metadataSectors = $state(2);
@@ -78,7 +79,7 @@
 
   async function extractData() {
     if (!selectedDevice) return;
-    extracting = true; extractProgress = null; tableRows = []; scrubResult = null;
+    extracting = true; extractProgress = null; tableRows = []; scrubResult = null; extractError = "";
     const csvPath = await save({
       title: "Save CSV", defaultPath: "zinf_data.csv",
       filters: [{ name: "CSV", extensions: ["csv"] }],
@@ -90,7 +91,10 @@
         yamlText,
       });
       parseYaml(yamlText);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      extractError = String(e);
+      console.error(e);
+    }
     finally { extracting = false; }
   }
 
@@ -214,6 +218,13 @@
                   {/each}
                 </tbody>
               </table>
+            {:else if extractError}
+              <div class="flex items-center justify-center h-full">
+                <div class="text-red-400 text-xs max-w-md text-center break-words px-4">
+                  <div class="font-semibold mb-1">Extraction failed</div>
+                  {extractError}
+                </div>
+              </div>
             {:else}
               <div class="flex items-center justify-center h-full text-gray-600 text-xs">
                 Click [Extract to CSV] to load data.

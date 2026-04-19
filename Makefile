@@ -10,7 +10,7 @@
 #   zinf info /dev/sdX
 #   sudo zinf bench /dev/sdX > results.csv
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall clean install-studio
 
 all:
 	$(MAKE) -C src
@@ -23,3 +23,8 @@ uninstall:
 
 clean:
 	$(MAKE) -C src clean
+
+install-studio:
+	@echo "Building ZINF Studio..."
+	cd zinf-studio && bun install && bun run tauri build
+	tools/install.sh

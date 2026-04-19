@@ -91,10 +91,18 @@ static int linux_init(driver_t *self)
 
     uint64_t bytes = 0;
     if (ioctl(ctx->fd, BLKGETSIZE64, &bytes) == 0) {
+        /* Block device: ioctl returns exact byte count */
         self->total_size_bytes = bytes;
         self->total_sectors    = bytes / self->sector_size;
     } else {
-        self->total_sectors = 0;
+        /* Regular file (.img): fall back to lseek to measure size */
+        off_t sz = lseek(ctx->fd, 0, SEEK_END);
+        if (sz > 0) {
+            self->total_size_bytes = (uint64_t)sz;
+            self->total_sectors    = (uint64_t)sz / self->sector_size;
+        } else {
+            self->total_sectors = 0;
+        }
     }
 
     return DRIVER_OK;

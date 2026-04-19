@@ -45,6 +45,7 @@ fn main() {
         .file(src_root.join("config/config.c"))
         .file(src_root.join("drivers/linux/linux_driver.c"))
         .file(src_root.join("platform/platform_linux.c"))
+        .file("zinf_studio_helpers.c")
         // Include paths
         .include(src_root.join("core/api"))
         .include(src_root.join("core/storage"))

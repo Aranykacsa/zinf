@@ -1,5 +1,5 @@
 /// Tauri command implementations: device scanning, data extraction, integrity check, config.
-use crate::hardware::{scan_zinf_devices as hw_scan, DeviceInfo};
+use crate::hardware::{loop_backing_file, scan_zinf_devices as hw_scan, DeviceInfo};
 use crate::zinf_ffi::{
     self, ScrubReport, STORAGE_OK,
 };
@@ -13,6 +13,44 @@ use tauri::{AppHandle, Emitter};
 
 /// Global lock to serialise all C library calls (not thread-safe internally)
 static ZINF_LOCK: Mutex<()> = Mutex::new(());
+
+/// Return the path that linux_driver should open.
+/// For loop devices the backing .img file is returned (user-readable without
+/// root). For real block devices the device node itself is returned.
+fn openable_path(device_path: &str) -> String {
+    if device_path.contains("loop") {
+        loop_backing_file(device_path).unwrap_or_else(|| device_path.to_owned())
+    } else {
+        device_path.to_owned()
+    }
+}
+
+/// Wire linux_driver into zinf_ctx and call setup_storage.
+///
+/// This matches what the CLI does at zinf_main.c:493-494:
+///   linux_driver_set_path(g_device);
+///   zinf_ctx->driver = &linux_driver;
+///
+/// Must be called inside the ZINF_LOCK critical section.
+/// `c_path` must remain alive for the duration of all subsequent FFI calls.
+unsafe fn init_zinf_ctx(c_path: &std::ffi::CStr) -> Result<*mut zinf_ffi::ZinfCtx, String> {
+    zinf_ffi::linux_driver_set_path(c_path.as_ptr());
+    // Wire linux_driver into zinf_ctx->driver — platform_linux.c leaves it NULL.
+    // The CLI does this at zinf_main.c:494: zinf_ctx->driver = &linux_driver;
+    zinf_ffi::zinf_studio_use_linux_driver();
+    let ctx = zinf_ffi::zinf_ctx;
+    if ctx.is_null() {
+        return Err("zinf_ctx is null".into());
+    }
+    let rc = zinf_ffi::setup_storage(ctx);
+    if rc != STORAGE_OK {
+        return Err(format!("setup_storage failed (rc={rc}) — check device path and permissions"));
+    }
+    // Fix mirror_offset: zinf_ctx_init_defaults falls back to 30 for regular files,
+    // but the image was formatted using (total_sectors - metadata) / mirror_count.
+    zinf_ffi::zinf_studio_fix_mirror_offset();
+    Ok(ctx)
+}
 
 // ---------------------------------------------------------------------------
 // YAML config types
@@ -46,6 +84,21 @@ pub struct ZinfYamlConfig {
 
 fn default_metadata_sectors() -> u8 { 2 }
 
+/// Parse zinf config from either the nested `zinf: { ... }` format used by
+/// zinf.yaml on disk, or the flat format used by the frontend's built-in fallback.
+fn parse_zinf_config(yaml_text: &str) -> Result<ZinfYamlConfig, String> {
+    // Wrapper matching the on-disk zinf.yaml structure: `zinf: { sector_size: … }`
+    #[derive(serde::Deserialize)]
+    struct Root { zinf: ZinfYamlConfig }
+
+    if let Ok(root) = serde_yaml::from_str::<Root>(yaml_text) {
+        return Ok(root.zinf);
+    }
+    // Fall back to flat format (frontend default / user-edited)
+    serde_yaml::from_str::<ZinfYamlConfig>(yaml_text)
+        .map_err(|e| format!("YAML parse error: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -68,19 +121,12 @@ pub struct ScrubResult {
 /// Verify integrity of a ZINF device by running zinf_scrub over all sectors.
 #[tauri::command]
 pub fn verify_integrity(device_path: String) -> Result<ScrubResult, String> {
-    let c_path = CString::new(device_path.as_str()).map_err(|e| e.to_string())?;
+    let open_path = openable_path(&device_path);
+    let c_path = CString::new(open_path.as_str()).map_err(|e| e.to_string())?;
     let _guard = ZINF_LOCK.lock().map_err(|e| e.to_string())?;
 
     unsafe {
-        zinf_ffi::linux_driver_set_path(c_path.as_ptr());
-        let ctx = zinf_ffi::zinf_ctx;
-        if ctx.is_null() {
-            return Err("zinf_ctx is null".into());
-        }
-        let rc = zinf_ffi::setup_storage(ctx);
-        if rc != STORAGE_OK {
-            return Err(format!("setup_storage failed: {rc}"));
-        }
+        let ctx = init_zinf_ctx(&c_path)?;
         let mut last: u64 = 0;
         zinf_ffi::get_last_sector(ctx, &mut last);
         if last == 0 {
@@ -120,16 +166,16 @@ pub async fn extract_data(
     output_csv: String,
     yaml_text: String,
 ) -> Result<Vec<SectorRow>, String> {
-    // Parse field schema from YAML
-    let config: ZinfYamlConfig =
-        serde_yaml::from_str(&yaml_text).map_err(|e| format!("YAML parse error: {e}"))?;
+    // Parse field schema from YAML (handles both nested zinf: and flat formats)
+    let config = parse_zinf_config(&yaml_text)?;
     let fields = config
         .data_types
         .first()
         .map(|dt| dt.fields.clone())
         .unwrap_or_default();
 
-    let c_path = CString::new(device_path.as_str()).map_err(|e| e.to_string())?;
+    let open_path = openable_path(&device_path);
+    let c_path = CString::new(open_path.as_str()).map_err(|e| e.to_string())?;
     let sector_size = config.sector_size as usize;
     let payload_size = sector_size - 1 - 4; // HEADER_SIZE=1, CRC=4
 
@@ -137,15 +183,7 @@ pub async fn extract_data(
     let _guard = ZINF_LOCK.lock().map_err(|e| e.to_string())?;
     let last_sector;
     unsafe {
-        zinf_ffi::linux_driver_set_path(c_path.as_ptr());
-        let ctx = zinf_ffi::zinf_ctx;
-        if ctx.is_null() {
-            return Err("zinf_ctx is null".into());
-        }
-        let rc = zinf_ffi::setup_storage(ctx);
-        if rc != STORAGE_OK {
-            return Err(format!("setup_storage failed: {rc}"));
-        }
+        let ctx = init_zinf_ctx(&c_path)?;
         let mut ls: u64 = 0;
         zinf_ffi::get_last_sector(ctx, &mut ls);
         last_sector = ls;
@@ -284,9 +322,8 @@ pub fn load_yaml() -> Result<String, String> {
 /// Write zinf.yaml and re-run zinf_gen.py to regenerate config.h / config.c.
 #[tauri::command]
 pub fn generate_config(yaml_text: String) -> Result<String, String> {
-    // Validate YAML parse first
-    let _: ZinfYamlConfig = serde_yaml::from_str(&yaml_text)
-        .map_err(|e| format!("Invalid YAML: {e}"))?;
+    // Validate YAML parse first (handles both nested zinf: and flat formats)
+    let _ = parse_zinf_config(&yaml_text)?;
 
     // Find zinf.yaml location
     let yaml_path = find_yaml_path()?;

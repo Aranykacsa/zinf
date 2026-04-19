@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/99-zinf-user.rules
+# Grant plugdev group read/write access to ZINF-formatted block devices.
+# Requires zinf-probe to be installed (sets ID_FS_TYPE=zinf via 99-zinf.rules).
+
+ENV{ID_FS_TYPE}=="zinf", GROUP="plugdev", MODE="0660"
