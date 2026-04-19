@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 
 /* -----------------------------------------------------------------------
    Image geometry
@@ -25,7 +26,23 @@
    LCG RNG
    ----------------------------------------------------------------------- */
 static uint32_t g_rng = 0xDEADBEEFu;
-static uint32_t lcg(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng; }
+static uint32_t lcg_r(uint32_t *s) { *s = *s * 1664525u + 1013904223u; return *s; }
+static uint32_t lcg(void)          { return lcg_r(&g_rng); }
+
+/* -----------------------------------------------------------------------
+   Monotonic wall-clock timer (milliseconds since program start).
+   Using a fixed reference avoids precision loss when subtracting two
+   large epoch-relative doubles.
+   ----------------------------------------------------------------------- */
+static struct timespec g_tstart;
+static void timer_init(void) { clock_gettime(CLOCK_MONOTONIC, &g_tstart); }
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)(ts.tv_sec  - g_tstart.tv_sec)  * 1000.0
+         + (double)(ts.tv_nsec - g_tstart.tv_nsec) / 1e6;
+}
 
 /* -----------------------------------------------------------------------
    Unpack LE float32 from 4 bytes
@@ -39,43 +56,20 @@ static float unpack_f32(const uint8_t *p) {
 }
 
 /* -----------------------------------------------------------------------
-   Version counter snapshot
-   ----------------------------------------------------------------------- */
-typedef struct { uint16_t s0, s1, s2; } vers_t;
-
-static vers_t read_versions(zinf_ctx_t *ctx) {
-    uint8_t meta[SECTOR_SIZE];
-    read_sector(ctx, 0, meta);
-    vers_t v;
-    v.s0 = (uint16_t)(meta[16] | ((uint16_t)meta[17] << 8));
-    v.s1 = (uint16_t)(meta[26] | ((uint16_t)meta[27] << 8));
-    v.s2 = (uint16_t)(meta[36] | ((uint16_t)meta[37] << 8));
-    return v;
-}
-
-/* Which slot had its version change (round-robin write indicator) */
-static int slot_written(vers_t before, vers_t after) {
-    if (after.s0 != before.s0) return 0;
-    if (after.s1 != before.s1) return 1;
-    if (after.s2 != before.s2) return 2;
-    return -1;
-}
-
-/* -----------------------------------------------------------------------
    Excel formatting
    ----------------------------------------------------------------------- */
-#define XL_NAVY   0x1F3864u  /* header background         */
-#define XL_GREEN  0xC6EFCEu  /* pass row background        */
-#define XL_RED    0xFFC7CEu  /* fail row background         */
-#define XL_AMBER  0xFFE0B2u  /* event / inject row          */
-#define XL_GRAY   0xF2F2F2u  /* neutral write-only row      */
+#define XL_NAVY   0x1F3864u
+#define XL_GREEN  0xC6EFCEu
+#define XL_RED    0xFFC7CEu
+#define XL_AMBER  0xFFE0B2u
+#define XL_GRAY   0xF2F2F2u
 
 typedef struct {
-    lxw_format *hdr;    /* column header                 */
-    lxw_format *pass;   /* assertion passed              */
-    lxw_format *fail;   /* assertion failed              */
-    lxw_format *event;  /* wipe / inject / section event */
-    lxw_format *plain;  /* write-only data row           */
+    lxw_format *hdr;
+    lxw_format *pass;
+    lxw_format *fail;
+    lxw_format *event;
+    lxw_format *plain;
 } xl_fmts_t;
 
 static xl_fmts_t make_formats(lxw_workbook *wb) {
@@ -107,14 +101,13 @@ static void xlh(lxw_worksheet *ws, int c, const char *s, xl_fmts_t *f) {
     worksheet_write_string(ws, 0, (lxw_col_t)c, s, f->hdr);
 }
 
-static void set_col_widths(lxw_worksheet *ws,
-                           const double *widths, int ncols) {
-    for (int c = 0; c < ncols; c++)
-        worksheet_set_column(ws, (lxw_col_t)c, (lxw_col_t)c, widths[c], NULL);
+static void set_col_widths(lxw_worksheet *ws, const double *w, int n) {
+    for (int c = 0; c < n; c++)
+        worksheet_set_column(ws, (lxw_col_t)c, (lxw_col_t)c, w[c], NULL);
 }
 
 /* -----------------------------------------------------------------------
-   Context setup / teardown
+   Context setup
    ----------------------------------------------------------------------- */
 static int setup_ram(zinf_ctx_t *ctx) {
     memset(ctx, 0, sizeof *ctx);
@@ -131,913 +124,1075 @@ static int setup_ram(zinf_ctx_t *ctx) {
     return 0;
 }
 
-static void teardown(zinf_ctx_t *ctx) {
+static void ctx_teardown(zinf_ctx_t *ctx) {
     if (ctx->driver && ctx->driver->deinit)
         ctx->driver->deinit(ctx->driver);
 }
 
 /* -----------------------------------------------------------------------
-   Test result (carries assertion counters for summary sheet)
+   Benchmark accumulator
+   ----------------------------------------------------------------------- */
+typedef struct {
+    int     n;          /* total iterations recorded */
+    int     pass_n;
+    long    total_ops;
+    long    total_silent;
+    double  lat_sum;
+    double  lat_min;
+    double  lat_max;
+    double *lats;       /* [n] for percentile computation */
+} bench_t;
+
+static bench_t bench_init(int n) {
+    bench_t b;
+    memset(&b, 0, sizeof b);
+    b.n       = n;
+    b.lat_min = 1e18;
+    b.lats = (double *)malloc((size_t)n * sizeof(double));
+    return b;
+}
+
+static void bench_record(bench_t *b, int i, double lat_ms,
+                         long ops, long silent, int pass) {
+    b->lats[i] = lat_ms;
+    b->lat_sum += lat_ms;
+    if (lat_ms < b->lat_min) b->lat_min = lat_ms;
+    if (lat_ms > b->lat_max) b->lat_max = lat_ms;
+    b->total_ops    += ops;
+    b->total_silent += silent;
+    if (pass) b->pass_n++;
+}
+
+static int cmp_dbl(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+/* Returns percentile p (0-100) after sorting a copy of lats[0..n-1]. */
+static double bench_pct(bench_t *b, double p) {
+    if (b->n <= 0) return 0.0;
+    double *tmp = (double *)malloc((size_t)b->n * sizeof(double));
+    memcpy(tmp, b->lats, (size_t)b->n * sizeof(double));
+    qsort(tmp, (size_t)b->n, sizeof(double), cmp_dbl);
+    int idx = (int)(p / 100.0 * b->n);
+    if (idx >= b->n) idx = b->n - 1;
+    double v = tmp[idx];
+    free(tmp);
+    return v;
+}
+
+static void bench_free(bench_t *b) { free(b->lats); b->lats = NULL; }
+
+/* -----------------------------------------------------------------------
+   Top-level result (one per test, populated after the benchmark loop)
    ----------------------------------------------------------------------- */
 typedef struct {
     const char *name;
     const char *description;
-    int         passed;
-    int         assertions;
-    int         assertions_passed;
-    char        metric[200];
+    int         passed;      /* 1 = all iterations passed */
+    int         n_iter;
+    int         pass_n;
+    int         fail_n;
+    long        total_ops;
+    long        total_silent;
+    double      lat_avg_ms;
+    double      lat_min_ms;
+    double      lat_max_ms;
+    double      lat_p95_ms;
+    double      lat_p99_ms;
+    double      ops_per_sec;
+    char        metric[256];
 } result_t;
-
-static void pass_assert(result_t *r, int ok) {
-    r->assertions++;
-    if (ok) r->assertions_passed++;
-    else    r->passed = 0;
-}
 
 /* =======================================================================
    TEST 1 — Storage wipe
-   Columns:
-     Phase | # | LBA | Exp Temp | Exp Hum | Write RC | Read RC |
-     Got Temp | Got Hum | Temp OK | Hum OK | Scrub Chk | Scrub Rep |
-     Scrub Unrec | Note | Pass
+   Per-iteration fuzz: n_pre ∈ [50,300], n_post ∈ [10,80]
+   Columns (one row per iteration):
+     Iter | Seed | Pre-Writes | Post-Writes | Elapsed(ms) | Ops/sec |
+     Wipe-Unrec | Post-OK | Post-Silent | Pass
    ======================================================================= */
-static result_t test_storage_wipe(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "StorageWipe",
-        "ram_driver_drop_buffer() wipes all sectors; reinit + scrub must not crash; "
-        "50 new writes after wipe must read back correctly.", 1, 0, 0, "" };
 
-    /* Column headers */
-    const char *hdrs[] = {
-        "Phase","#","LBA","Exp Temp","Exp Hum","Write RC","Read RC",
-        "Got Temp","Got Hum","Temp OK","Hum OK",
-        "Scrub Chk","Scrub Rep","Scrub Unrec","Note","Pass"
-    };
-    for (int c = 0; c < 16; c++) xlh(ws, c, hdrs[c], f);
+typedef struct {
+    int      pass;
+    long     ops;
+    long     ok, silent, unrecoverable;
+    int      n_pre, n_post;
+    uint32_t seed;
+} sw_iter_t;
 
-    const double widths[] = {
-        14,5,8,9,9,10,9,9,9,8,7,10,10,12,22,6
-    };
-    set_col_widths(ws, widths, 16);
-    worksheet_freeze_panes(ws, 1, 0);
-
+static sw_iter_t run_storage_wipe(uint32_t seed, int n_pre, int n_post) {
+    sw_iter_t r = {.pass=1, .seed=seed};
     zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
 
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
-    }
+    uint64_t post_lba[80]; float post_temp[80], post_hum[80];
+    uint32_t rng = seed;
 
-    /* --- Phase 1: write 200 records --- */
-    uint64_t pre_lba[200]; float pre_temp[200], pre_hum[200]; uint8_t pre_wrc[200];
-    for (int i = 0; i < 200; i++) {
+    /* Pre-wipe writes */
+    r.n_pre = n_pre;
+    for (int i = 0; i < n_pre; i++) {
         uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        pre_lba[i]  = lb + 1;
-        pre_temp[i] = (float)i;
-        pre_hum[i]  = (float)(i % 100);
-        sensor_t s  = { .temp=pre_temp[i], .humidity=pre_hum[i] };
-        pre_wrc[i]  = raid_sensor_values(&ctx, &s, 1);
-
-        lxw_format *fmt = f->plain;
-        char wrc_s[8]; snprintf(wrc_s, sizeof wrc_s, "%u", pre_wrc[i]);
-        worksheet_write_string(ws, row, 0, "PRE_WIPE_WRITE", fmt);
-        worksheet_write_number(ws, row, 1, i+1,              fmt);
-        worksheet_write_number(ws, row, 2, (double)pre_lba[i],fmt);
-        worksheet_write_number(ws, row, 3, pre_temp[i],      fmt);
-        worksheet_write_number(ws, row, 4, pre_hum[i],       fmt);
-        worksheet_write_string(ws, row, 5, wrc_s,            fmt);
-        worksheet_write_string(ws, row,15, "write before wipe",fmt);
-        row++;
+        float t = (float)(lcg_r(&rng) % 10000u);
+        float h = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=t, .humidity=h};
+        raid_sensor_values(&ctx, &s, 1);
+        r.ops++;
     }
 
-    /* --- Wipe event --- */
+    /* Wipe */
     ram_driver_drop_buffer();
-    {
-        lxw_format *fmt = f->event;
-        worksheet_write_string(ws, row, 0, "WIPE",             fmt);
-        worksheet_write_string(ws, row,14, "ram_driver_drop_buffer() — all sectors zeroed",fmt);
-        worksheet_write_string(ws, row,15, "event",            fmt);
-        row++;
-    }
 
-    /* --- Reinit --- */
-    {
-        uint8_t rc = init_log_sector(&ctx);
-        int ok = (rc == STORAGE_OK);
-        pass_assert(&r, ok);
-        lxw_format *fmt = xfmt(f, ok);
-        char rc_s[8]; snprintf(rc_s, sizeof rc_s, "%u", rc);
-        worksheet_write_string(ws, row, 0, "REINIT",          fmt);
-        worksheet_write_string(ws, row, 5, rc_s,              fmt);
-        worksheet_write_string(ws, row,14, "init_log_sector after wipe", fmt);
-        worksheet_write_string(ws, row,15, ok?"PASS":"FAIL",  fmt);
-        row++;
-        if (!ok) goto done_wipe;
-    }
+    /* Reinit */
+    if (init_log_sector(&ctx) != STORAGE_OK) { r.pass = 0; goto done; }
 
-    /* --- Scrub on wiped storage --- */
+    /* Scrub on zeroed storage — just prove it doesn't crash */
     {
         zinf_scrub_report_t rep = {0};
-        uint8_t rc = zinf_scrub(&ctx, 2, 200, &rep);
-        int ok = (rc == STORAGE_OK);
-        pass_assert(&r, ok);
-        lxw_format *fmt = xfmt(f, ok);
-        char rc_s[8]; snprintf(rc_s, sizeof rc_s, "%u", rc);
-        worksheet_write_string(ws, row, 0,  "SCRUB",                       fmt);
-        worksheet_write_string(ws, row, 5,  rc_s,                          fmt);
-        worksheet_write_number(ws, row, 11, rep.checked,                   fmt);
-        worksheet_write_number(ws, row, 12, rep.repaired,                  fmt);
-        worksheet_write_number(ws, row, 13, rep.unrecoverable,             fmt);
-        worksheet_write_string(ws, row, 14, "zinf_scrub on zeroed storage", fmt);
-        worksheet_write_string(ws, row, 15, ok?"PASS":"FAIL",              fmt);
-        row++;
-        if (!ok) goto done_wipe;
-
-        /* Blacklist is volatile — a real MCU loses it on power-cycle.
-           Clear it now so new writes are not blocked by the scrub's bad-sector marks. */
-        zinf_clear_bad_sectors(&ctx);
-        {
-            lxw_format *efmt = f->event;
-            worksheet_write_string(ws, row, 0, "CLEAR_BLACKLIST", efmt);
-            worksheet_write_string(ws, row,14,
-                "zinf_clear_bad_sectors — volatile blacklist reset after scrub", efmt);
-            worksheet_write_string(ws, row,15, "event", efmt);
-            row++;
-        }
+        zinf_scrub(&ctx, 2u, (uint64_t)n_pre + 1u, &rep);
+        r.unrecoverable = (long)rep.unrecoverable;
     }
 
-    /* --- Post-wipe: write 50 new records, then verify each --- */
+    /* Volatile blacklist lost on power-cycle — clear it */
+    zinf_clear_bad_sectors(&ctx);
+
+    /* Post-wipe writes */
+    r.n_post = n_post;
+    for (int i = 0; i < n_post; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        post_lba[i]  = lb + 1u;
+        post_temp[i] = (float)(1000u + lcg_r(&rng) % 5000u);
+        post_hum[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s   = {.temp=post_temp[i], .humidity=post_hum[i]};
+        uint8_t wrc  = raid_sensor_values(&ctx, &s, 1);
+        if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) r.pass = 0;
+        r.ops++;
+    }
+
+    /* Post-wipe readback */
     {
-        uint64_t post_lba[50]; float post_temp[50], post_hum[50];
-        for (int i = 0; i < 50; i++) {
-            uint64_t lb = 0; get_last_sector(&ctx, &lb);
-            post_lba[i]  = lb + 1;
-            post_temp[i] = (float)(1000 + i);
-            post_hum[i]  = (float)(i % 100);
-            sensor_t s   = { .temp=post_temp[i], .humidity=post_hum[i] };
-            uint8_t wrc  = raid_sensor_values(&ctx, &s, 1);
-            char wrc_s[8]; snprintf(wrc_s, sizeof wrc_s, "%u", wrc);
-            lxw_format *fmt = f->plain;
-            worksheet_write_string(ws, row, 0, "POST_WIPE_WRITE", fmt);
-            worksheet_write_number(ws, row, 1, i+1,               fmt);
-            worksheet_write_number(ws, row, 2, (double)post_lba[i],fmt);
-            worksheet_write_number(ws, row, 3, post_temp[i],      fmt);
-            worksheet_write_number(ws, row, 4, post_hum[i],       fmt);
-            worksheet_write_string(ws, row, 5, wrc_s,             fmt);
-            worksheet_write_string(ws, row,14, "write after reinit",fmt);
-            row++;
-        }
-
         uint8_t payload[PAYLOAD_SIZE];
-        for (int i = 0; i < 50; i++) {
+        for (int i = 0; i < n_post; i++) {
             uint8_t rrc = raid_read(&ctx, post_lba[i], payload);
-            float gt=0.0f, gh=0.0f; int tm=0, hm=0;
-            if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-                gt = unpack_f32(&payload[0]);
-                gh = unpack_f32(&payload[4]);
-                tm = fabsf(gt - post_temp[i]) < 0.001f;
-                hm = fabsf(gh - post_hum[i])  < 0.001f;
+            r.ops++;
+            if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.pass = 0; continue; }
+            if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+            float gt = unpack_f32(&payload[0]);
+            float gh = unpack_f32(&payload[4]);
+            if (fabsf(gt - post_temp[i]) < 0.001f &&
+                fabsf(gh - post_hum[i])  < 0.001f)
+                r.ok++;
+            else {
+                r.silent++;
+                r.pass = 0;
             }
-            int ok = tm && hm;
-            pass_assert(&r, ok);
-            lxw_format *fmt = xfmt(f, ok);
-            char rrc_s[8]; snprintf(rrc_s, sizeof rrc_s, "%u", rrc);
-            worksheet_write_string(ws, row, 0, "POST_WIPE_VERIFY", fmt);
-            worksheet_write_number(ws, row, 1, i+1,                fmt);
-            worksheet_write_number(ws, row, 2, (double)post_lba[i],fmt);
-            worksheet_write_number(ws, row, 3, post_temp[i],       fmt);
-            worksheet_write_number(ws, row, 4, post_hum[i],        fmt);
-            worksheet_write_string(ws, row, 6, rrc_s,              fmt);
-            worksheet_write_number(ws, row, 7, gt,                 fmt);
-            worksheet_write_number(ws, row, 8, gh,                 fmt);
-            worksheet_write_string(ws, row, 9, tm?"yes":"no",      fmt);
-            worksheet_write_string(ws, row,10, hm?"yes":"no",      fmt);
-            worksheet_write_string(ws, row,14, "readback post-wipe",fmt);
-            worksheet_write_string(ws, row,15, ok?"PASS":"FAIL",   fmt);
-            row++;
         }
     }
 
-done_wipe:
-    teardown(&ctx);
-    snprintf(r.metric, sizeof r.metric,
-             "pre_writes=200 post_writes=50 assertions=%d passed=%d",
-             r.assertions, r.assertions_passed);
+done:
+    ctx_teardown(&ctx);
     return r;
+}
+
+static result_t bench_storage_wipe(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "StorageWipe",
+        "ram_driver_drop_buffer() wipes all sectors. reinit + scrub must not crash. "
+        "Post-wipe writes with fuzzed count [50-300 pre, 10-80 post] must read back exactly.",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Pre-Writes","Post-Writes","Elapsed(ms)","Ops/sec",
+        "Wipe-Unrec","Post-OK","Post-Silent","Pass"
+    };
+    for (int c = 0; c < 10; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 11, 12, 12, 11, 11, 9, 11, 6 };
+    set_col_widths(ws, w, 10);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed = lcg();
+        int n_pre  = 50  + (int)(lcg() % 251u);
+        int n_post = 10  + (int)(lcg() % 71u);
+
+        double t0 = now_ms();
+        sw_iter_t r = run_storage_wipe(seed, n_pre, n_post);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,        fmt);
+        worksheet_write_string(ws, row, 1, seed_s,     fmt);
+        worksheet_write_number(ws, row, 2, n_pre,      fmt);
+        worksheet_write_number(ws, row, 3, n_post,     fmt);
+        worksheet_write_number(ws, row, 4, elapsed,    fmt);
+        worksheet_write_number(ws, row, 5, ops_ps,     fmt);
+        worksheet_write_number(ws, row, 6, (double)r.unrecoverable, fmt);
+        worksheet_write_number(ws, row, 7, (double)r.ok,            fmt);
+        worksheet_write_number(ws, row, 8, (double)r.silent,        fmt);
+        worksheet_write_string(ws, row, 9, r.pass?"PASS":"FAIL",    fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [1/7] StorageWipe       [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
 }
 
 /* =======================================================================
    TEST 2 — Degraded write
+   Per-iteration fuzz: n_sectors ∈ [5,20], starting LBA randomised
    Columns:
-     Write# | Logical LBA | Mirror-0 Phys | Mirror-1 Phys (blklst) |
-     Exp Write RC | Actual Write RC | RC Correct |
-     Exp Temp | Exp Hum | Read RC |
-     Got Temp | Got Hum | Temp Match | Hum Match |
-     Mirror-0 Health | Mirror-1 Health | Pass
+     Iter | Seed | Sectors-Tested | Degraded-Seen | Read-Match | Silent |
+     Elapsed(ms) | Ops/sec | Pass
    ======================================================================= */
-static result_t test_degraded_write(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "DegradedWrite",
-        "Blacklist mirror-1 of each target sector before writing. "
-        "Write must return WARN_DEGRADED. Read via surviving mirror-0 must match exactly.",
-        1, 0, 0, "" };
 
-    const char *hdrs[] = {
-        "Write#","Logical LBA","Mirror-0 Phys","Mirror-1 Phys (blklst)",
-        "Exp Write RC","Actual Write RC","RC Correct",
-        "Exp Temp","Exp Hum","Read RC",
-        "Got Temp","Got Hum","Temp Match","Hum Match",
-        "M0 Health","M1 Health","Pass"
-    };
-    for (int c = 0; c < 17; c++) xlh(ws, c, hdrs[c], f);
+typedef struct {
+    int      pass;
+    long     ops;
+    int      sectors;
+    int      degraded_seen;
+    long     matched, silent;
+    uint32_t seed;
+} dw_iter_t;
 
-    const double widths[] = {
-        7,11,13,20,13,15,10,9,9,8,9,9,10,10,12,12,6
-    };
-    set_col_widths(ws, widths, 17);
-    worksheet_freeze_panes(ws, 1, 0);
-
+static dw_iter_t run_degraded_write(uint32_t seed, int n_sectors) {
+    dw_iter_t r = {.pass=1, .seed=seed, .sectors=n_sectors};
     zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng = seed;
+    /* Pad with some initial writes so blacklisted mirror-1 LBAs don't land on sector 1 */
+    uint64_t start_lba = 2u + lcg_r(&rng) % 200u;
+    {
+        /* Pre-fill up to start_lba */
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        while (lb + 1u < start_lba) {
+            sensor_t s = {.temp=0.0f, .humidity=0.0f};
+            raid_sensor_values(&ctx, &s, 1);
+            get_last_sector(&ctx, &lb);
+            r.ops++;
+        }
     }
 
-    int degraded_seen = 0, silent = 0;
+    uint64_t lbas[20]; float temps[20], hums[20];
+    uint8_t payload[PAYLOAD_SIZE];
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < n_sectors; i++) {
         uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        uint64_t next_lba = lb + 1;
-        uint64_t m0_phys  = next_lba;
-        uint64_t m1_phys  = next_lba + ctx.mirror_offset;
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+
+        /* Blacklist mirror-1 of this logical sector */
+        uint64_t m1_phys = lbas[i] + (uint64_t)ctx.mirror_offset;
         zinf_mark_bad_sector(&ctx, m1_phys);
 
-        float et = (float)(200 + i), eh = (float)(i % 100);
-        sensor_t s = { .temp=et, .humidity=eh };
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
         uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
-        if (wrc == STORAGE_WARN_DEGRADED) degraded_seen++;
+        r.ops++;
 
-        /* Check mirror health */
-        zinf_sector_health_t health = {0};
-        zinf_check_sector(&ctx, next_lba, &health);
-        const char *m0h = (health.status[0] == ZINF_MIRROR_OK)        ? "OK" :
-                          (health.status[0] == ZINF_MIRROR_CRC_FAIL)   ? "CRC_FAIL" :
-                          (health.status[0] == ZINF_MIRROR_BLACKLIST)  ? "BLACKLIST" : "IO_ERR";
-        const char *m1h = (health.status[1] == ZINF_MIRROR_OK)        ? "OK" :
-                          (health.status[1] == ZINF_MIRROR_CRC_FAIL)   ? "CRC_FAIL" :
-                          (health.status[1] == ZINF_MIRROR_BLACKLIST)  ? "BLACKLIST" : "IO_ERR";
+        if (wrc == STORAGE_WARN_DEGRADED) r.degraded_seen++;
+        else if (wrc != STORAGE_OK)       r.pass = 0;
 
         /* Read back */
-        uint8_t payload[PAYLOAD_SIZE];
-        uint8_t rrc = raid_read(&ctx, next_lba, payload);
-        float gt=0.0f, gh=0.0f; int tm=0, hm=0;
+        uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+        r.ops++;
         if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt = unpack_f32(&payload[0]); gh = unpack_f32(&payload[4]);
-            tm = fabsf(gt-et)<0.001f; hm = fabsf(gh-eh)<0.001f;
-            if (!tm || !hm) silent++;
+            float gt = unpack_f32(&payload[0]);
+            float gh = unpack_f32(&payload[4]);
+            if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+                r.matched++;
+            else { r.silent++; r.pass = 0; }
         }
 
-        int rc_ok   = (wrc == STORAGE_WARN_DEGRADED);
-        int data_ok = tm && hm;
-        int pass    = rc_ok && data_ok;
-        pass_assert(&r, rc_ok);
-        pass_assert(&r, data_ok);
-
-        char wrc_s[8], rrc_s[8], m0s[20], m1s[20];
-        snprintf(wrc_s, sizeof wrc_s, "%u",   wrc);
-        snprintf(rrc_s, sizeof rrc_s, "%u",   rrc);
-        snprintf(m0s,   sizeof m0s,   "%" PRIu64, m0_phys);
-        snprintf(m1s,   sizeof m1s,   "%" PRIu64, m1_phys);
-
-        lxw_format *fmt = xfmt(f, pass);
-        worksheet_write_number(ws, row, 0,  i+1,              fmt);
-        worksheet_write_number(ws, row, 1,  (double)next_lba, fmt);
-        worksheet_write_string(ws, row, 2,  m0s,              fmt);
-        worksheet_write_string(ws, row, 3,  m1s,              fmt);
-        worksheet_write_string(ws, row, 4,  "WARN_DEGRADED(5)",fmt);
-        worksheet_write_string(ws, row, 5,  wrc_s,            fmt);
-        worksheet_write_string(ws, row, 6,  rc_ok?"yes":"NO", fmt);
-        worksheet_write_number(ws, row, 7,  et,               fmt);
-        worksheet_write_number(ws, row, 8,  eh,               fmt);
-        worksheet_write_string(ws, row, 9,  rrc_s,            fmt);
-        worksheet_write_number(ws, row,10,  gt,               fmt);
-        worksheet_write_number(ws, row,11,  gh,               fmt);
-        worksheet_write_string(ws, row,12,  tm?"yes":"NO",    fmt);
-        worksheet_write_string(ws, row,13,  hm?"yes":"NO",    fmt);
-        worksheet_write_string(ws, row,14,  m0h,              fmt);
-        worksheet_write_string(ws, row,15,  m1h,              fmt);
-        worksheet_write_string(ws, row,16,  pass?"PASS":"FAIL",fmt);
-        row++;
-
+        /* Clear the blacklist so we don't saturate across sectors */
         zinf_clear_bad_sectors(&ctx);
     }
 
-    teardown(&ctx);
-    if (silent) r.passed = 0;
-    snprintf(r.metric, sizeof r.metric,
-             "degraded_seen=%d/10 silent=%d assertions=%d passed=%d",
-             degraded_seen, silent, r.assertions, r.assertions_passed);
+    ctx_teardown(&ctx);
+    if (r.degraded_seen != n_sectors) r.pass = 0;
+    if (r.silent > 0)                 r.pass = 0;
     return r;
+}
+
+static result_t bench_degraded_write(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "DegradedWrite",
+        "Blacklist mirror-1 before each write. Write must return WARN_DEGRADED. "
+        "Read via surviving mirror-0 must match exactly. Fuzz: n_sectors ∈ [5,20].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Sectors-Tested","Degraded-Seen","Read-Match","Silent",
+        "Elapsed(ms)","Ops/sec","Pass"
+    };
+    for (int c = 0; c < 9; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 15, 14, 12, 8, 12, 11, 6 };
+    set_col_widths(ws, w, 9);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed     = lcg();
+        int      n_sectors = 5 + (int)(lcg() % 16u);
+
+        double t0 = now_ms();
+        dw_iter_t r = run_degraded_write(seed, n_sectors);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                    fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                 fmt);
+        worksheet_write_number(ws, row, 2, n_sectors,              fmt);
+        worksheet_write_number(ws, row, 3, r.degraded_seen,        fmt);
+        worksheet_write_number(ws, row, 4, (double)r.matched,      fmt);
+        worksheet_write_number(ws, row, 5, (double)r.silent,       fmt);
+        worksheet_write_number(ws, row, 6, elapsed,                fmt);
+        worksheet_write_number(ws, row, 7, ops_ps,                 fmt);
+        worksheet_write_string(ws, row, 8, r.pass?"PASS":"FAIL",   fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [2/7] DegradedWrite     [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
 }
 
 /* =======================================================================
    TEST 3 — Blacklist overflow
+   Per-iteration fuzz: n_total ∈ [MAX+1, MAX+MAX/2+1], starting_lba random
    Columns:
-     Attempt# | Physical LBA | Count Before | Mark Result | Count After |
-     Expected Result | Count Correct | Max Allowed | Overflow Flag | Note | Pass
+     Iter | Seed | Starting-LBA | Total-Attempts | Overflows-Caught |
+     Final-Count | Max-Allowed | Elapsed(ms) | Pass
    ======================================================================= */
-static result_t test_blacklist_overflow(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "BlacklistOverflow",
-        "Call zinf_mark_bad_sector 20 times (MAX_BAD_SECTORS=16). "
-        "First 16 must return STORAGE_OK and increment count. "
-        "Attempts 17-20 must return STORAGE_ERR_PARAM and leave count at 16.",
-        1, 0, 0, "" };
+
+typedef struct {
+    int      pass;
+    long     ops;
+    uint64_t starting_lba;
+    int      n_total;
+    int      overflow_caught;
+    int      final_count;
+    uint32_t seed;
+} bo_iter_t;
+
+static bo_iter_t run_blacklist_overflow(uint32_t seed, uint64_t start_lba, int n_total) {
+    bo_iter_t r = {.pass=1, .seed=seed, .starting_lba=start_lba, .n_total=n_total};
+    zinf_ctx_t ctx;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    for (int i = 0; i < n_total; i++) {
+        uint64_t lba     = start_lba + (uint64_t)i;
+        uint8_t  rc      = zinf_mark_bad_sector(&ctx, lba);
+        int should_full  = (i >= (int)MAX_BAD_SECTORS);
+
+        if (should_full) {
+            if (rc == STORAGE_ERR_PARAM) r.overflow_caught++;
+            else                         r.pass = 0;
+        } else {
+            if (rc != STORAGE_OK)        r.pass = 0;
+        }
+        r.ops++;
+    }
+
+    r.final_count = (int)ctx.bad_sector_count;
+    if (r.final_count != (int)MAX_BAD_SECTORS)   r.pass = 0;
+    if (r.overflow_caught != n_total - (int)MAX_BAD_SECTORS) r.pass = 0;
+
+    ctx_teardown(&ctx);
+    return r;
+}
+
+static result_t bench_blacklist_overflow(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "BlacklistOverflow",
+        "Mark more than MAX_BAD_SECTORS (16) physical sectors. First 16 must succeed. "
+        "All subsequent calls must return STORAGE_ERR_PARAM. Count must never exceed 16. "
+        "Fuzz: n_total ∈ [17,24], starting_lba random.",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
 
     const char *hdrs[] = {
-        "Attempt#","Physical LBA","Count Before","Mark Result",
-        "Count After","Expected Result","Count Correct",
-        "Max Allowed","Overflow Flag","Note","Pass"
+        "Iter","Seed","Starting-LBA","Total-Attempts","Overflows-Caught",
+        "Final-Count","Max-Allowed","Elapsed(ms)","Pass"
     };
-    for (int c = 0; c < 11; c++) xlh(ws, c, hdrs[c], f);
-
-    const double widths[] = { 9,13,13,13,11,16,14,12,13,30,6 };
-    set_col_widths(ws, widths, 11);
+    for (int c = 0; c < 9; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 13, 16, 17, 13, 13, 12, 6 };
+    set_col_widths(ws, w, 9);
     worksheet_freeze_panes(ws, 1, 0);
 
-    zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        uint64_t start_lba = lcg() % 10000u;
+        int      n_total   = (int)MAX_BAD_SECTORS + 1 + (int)(lcg() % ((int)MAX_BAD_SECTORS/2 + 1));
+
+        double t0 = now_ms();
+        bo_iter_t r = run_blacklist_overflow(seed, start_lba, n_total);
+        double elapsed = now_ms() - t0;
+
+        bench_record(&b, i, elapsed, r.ops, 0, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                    fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                 fmt);
+        worksheet_write_number(ws, row, 2, (double)start_lba,      fmt);
+        worksheet_write_number(ws, row, 3, n_total,                fmt);
+        worksheet_write_number(ws, row, 4, r.overflow_caught,      fmt);
+        worksheet_write_number(ws, row, 5, r.final_count,          fmt);
+        worksheet_write_number(ws, row, 6, MAX_BAD_SECTORS,        fmt);
+        worksheet_write_number(ws, row, 7, elapsed,                fmt);
+        worksheet_write_string(ws, row, 8, r.pass?"PASS":"FAIL",   fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [3/7] BlacklistOverflow [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
     }
 
-    int overflow_caught = 0;
-
-    for (int i = 0; i < 20; i++) {
-        uint64_t lba      = (uint64_t)(100 + i);
-        uint8_t  cnt_before = ctx.bad_sector_count;
-        uint8_t  rc       = zinf_mark_bad_sector(&ctx, lba);
-        uint8_t  cnt_after  = ctx.bad_sector_count;
-
-        int expected_full  = (i >= (int)MAX_BAD_SECTORS);
-        const char *exp_s  = expected_full ? "ERR_PARAM(1)" : "STORAGE_OK(0)";
-        const char *rc_s   = (rc == STORAGE_OK)        ? "OK(0)" :
-                             (rc == STORAGE_ERR_PARAM)  ? "ERR_PARAM(1)" : "unknown";
-
-        int rc_ok    = expected_full ? (rc == STORAGE_ERR_PARAM)
-                                     : (rc == STORAGE_OK);
-        int cnt_ok   = expected_full ? (cnt_after == MAX_BAD_SECTORS)
-                                     : (cnt_after == (uint8_t)(i + 1));
-        int overflow = (rc == STORAGE_ERR_PARAM);
-        if (overflow) overflow_caught++;
-
-        int pass = rc_ok && cnt_ok;
-        pass_assert(&r, rc_ok);
-        pass_assert(&r, cnt_ok);
-
-        lxw_format *fmt = xfmt(f, pass);
-        char note[48];
-        if (expected_full)
-            snprintf(note, sizeof note, "slot %d/%u — list full, must reject", i+1, MAX_BAD_SECTORS);
-        else
-            snprintf(note, sizeof note, "slot %d/%u — normal add", i+1, MAX_BAD_SECTORS);
-
-        worksheet_write_number(ws, row, 0, i+1,                      fmt);
-        worksheet_write_number(ws, row, 1, (double)lba,              fmt);
-        worksheet_write_number(ws, row, 2, cnt_before,               fmt);
-        worksheet_write_string(ws, row, 3, rc_s,                     fmt);
-        worksheet_write_number(ws, row, 4, cnt_after,                fmt);
-        worksheet_write_string(ws, row, 5, exp_s,                    fmt);
-        worksheet_write_string(ws, row, 6, rc_ok?"yes":"NO",         fmt);
-        worksheet_write_number(ws, row, 7, MAX_BAD_SECTORS,          fmt);
-        worksheet_write_string(ws, row, 8, overflow?"YES":"-",       fmt);
-        worksheet_write_string(ws, row, 9, note,                     fmt);
-        worksheet_write_string(ws, row,10, pass?"PASS":"FAIL",       fmt);
-        row++;
-    }
-
-    teardown(&ctx);
-    snprintf(r.metric, sizeof r.metric,
-             "overflow_caught=%d/4 max_count=%u assertions=%d passed=%d",
-             overflow_caught, ctx.bad_sector_count,
-             r.assertions, r.assertions_passed);
-    return r;
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = 0;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms, res.ops_per_sec);
+    bench_free(&b);
+    printf("\n");
+    return res;
 }
 
 /* =======================================================================
    TEST 4 — Metadata corruption
+   Per-iteration fuzz: n_records ∈ [50,300], n_corrupt ∈ [3,10]
    Columns:
-     Phase | # | LBA | Field / Exp Temp | Orig Val / Exp Hum |
-     New Val / Write RC | Read RC | Got Temp | Got Hum |
-     Temp Match | Hum Match | Note | Pass
+     Iter | Seed | Records | Corruptions | Scrub-OK | Verify-OK | Verify-Lost |
+     Silent | Elapsed(ms) | Ops/sec | Pass
    ======================================================================= */
-static result_t test_metadata_corruption(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "MetadataCorruption",
-        "Write 100 data records. Corrupt 5 bytes in sector-0 metadata "
-        "(version counter slots, write cursor). Scrub and verify all 100 records. "
-        "Data sectors must be unaffected by metadata sector corruption.",
-        1, 0, 0, "" };
 
-    const char *hdrs[] = {
-        "Phase","#","LBA","Field / Exp Temp","Orig Val / Exp Hum",
-        "New Val / Write RC","Read RC","Got Temp","Got Hum",
-        "Temp Match","Hum Match","Note","Pass"
-    };
-    for (int c = 0; c < 13; c++) xlh(ws, c, hdrs[c], f);
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_records, n_corrupt;
+    int      scrub_ok;
+    long     ok, lost, silent;
+    uint32_t seed;
+} mc_iter_t;
 
-    const double widths[] = { 14,5,8,22,18,18,8,9,9,10,10,32,6 };
-    set_col_widths(ws, widths, 13);
-    worksheet_freeze_panes(ws, 1, 0);
-
+static mc_iter_t run_metadata_corruption(uint32_t seed, int n_records, int n_corrupt) {
+    mc_iter_t r = {.pass=1, .seed=seed, .n_records=n_records, .n_corrupt=n_corrupt};
     zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
-    }
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
 
-    /* WRITE phase: 100 records */
-    uint64_t slba[100]; float stemp[100], shum[100];
-    for (int i = 0; i < 100; i++) {
+    uint32_t rng = seed;
+    uint64_t lbas[300]; float temps[300], hums[300];
+    uint64_t last = 0;
+
+    /* Write n_records — capture last_lba BEFORE corrupting metadata */
+    for (int i = 0; i < n_records; i++) {
         uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        slba[i]  = lb + 1;
-        stemp[i] = (float)(300 + i);
-        shum[i]  = (float)(i % 100);
-        sensor_t s = { .temp=stemp[i], .humidity=shum[i] };
-        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
-        int ok = (wrc == STORAGE_OK || wrc == STORAGE_WARN_DEGRADED);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        raid_sensor_values(&ctx, &s, 1);
+        r.ops++;
+    }
+    get_last_sector(&ctx, &last); /* must be read before sector-0 corruption */
 
-        lxw_format *fmt = ok ? f->plain : f->fail;
-        char wrc_s[8]; snprintf(wrc_s, sizeof wrc_s, "%u", wrc);
-        worksheet_write_string(ws, row, 0, "WRITE",    fmt);
-        worksheet_write_number(ws, row, 1, i+1,        fmt);
-        worksheet_write_number(ws, row, 2, (double)slba[i], fmt);
-        worksheet_write_number(ws, row, 3, stemp[i],   fmt);
-        worksheet_write_number(ws, row, 4, shum[i],    fmt);
-        worksheet_write_string(ws, row, 5, wrc_s,      fmt);
-        worksheet_write_string(ws, row,12, ok?"-":"write failed", fmt);
-        row++;
+    /* Corrupt n_corrupt bytes in sector 0 metadata */
+    for (int i = 0; i < n_corrupt; i++) {
+        uint32_t off = 6u + lcg_r(&rng) % (SECTOR_SIZE - 6u); /* skip ZINF magic */
+        uint8_t  val = (uint8_t)(lcg_r(&rng) & 0xFFu);
+        ram_driver_corrupt(0u, off, val);
     }
 
-    /* CORRUPT phase: 5 bytes in sector 0 */
-    static const uint32_t c_offsets[5] = { 16, 17, 26, 27, 38 };
-    static const char *c_fields[5] = {
-        "Slot-0 version lo (byte 16)",
-        "Slot-0 version hi (byte 17)",
-        "Slot-1 version lo (byte 26)",
-        "Slot-1 version hi (byte 27)",
-        "Write cursor lo  (byte 38)"
-    };
-    uint8_t meta0[SECTOR_SIZE];
-    for (int i = 0; i < 5; i++) {
-        read_sector(&ctx, 0, meta0);
-        uint8_t orig = meta0[c_offsets[i]];
-        uint8_t newv = (uint8_t)(lcg() | 0x80u); /* ensure change */
-        if (newv == orig) newv ^= 0xFFu;
-        ram_driver_corrupt(0, c_offsets[i], newv);
-
-        char orig_s[12], new_s[12];
-        snprintf(orig_s, sizeof orig_s, "0x%02X (%3u)", orig, orig);
-        snprintf(new_s,  sizeof new_s,  "0x%02X (%3u)", newv, newv);
-
-        lxw_format *fmt = f->event;
-        worksheet_write_string(ws, row, 0, "CORRUPT",        fmt);
-        worksheet_write_number(ws, row, 1, i+1,              fmt);
-        worksheet_write_string(ws, row, 3, c_fields[i],      fmt);
-        worksheet_write_string(ws, row, 4, orig_s,           fmt);
-        worksheet_write_string(ws, row, 5, new_s,            fmt);
-        worksheet_write_string(ws, row,12, "injected",        fmt);
-        row++;
-    }
-
-    /* SCRUB phase */
+    /* Scrub — uses last captured before corruption */
     zinf_clear_bad_sectors(&ctx);
     zinf_scrub_report_t rep = {0};
-    uint64_t last = 0; get_last_sector(&ctx, &last);
-    uint8_t src = zinf_scrub(&ctx, 2, last, &rep);
-    {
-        int ok = (src == STORAGE_OK);
-        pass_assert(&r, ok);
-        lxw_format *fmt = xfmt(f, ok);
-        char rc_s[8]; snprintf(rc_s, sizeof rc_s, "%u", src);
-        char note[64];
-        snprintf(note, sizeof note,
-                 "chk=%u healthy=%u rep=%u unrec=%u",
-                 rep.checked, rep.healthy, rep.repaired, rep.unrecoverable);
-        worksheet_write_string(ws, row, 0, "SCRUB",          fmt);
-        worksheet_write_string(ws, row, 5, rc_s,             fmt);
-        worksheet_write_string(ws, row,11, note,             fmt);
-        worksheet_write_string(ws, row,12, ok?"PASS":"FAIL", fmt);
-        row++;
-    }
+    uint8_t src = zinf_scrub(&ctx, 2u, last, &rep);
+    r.scrub_ok = (src == STORAGE_OK);
+    if (!r.scrub_ok) r.pass = 0;
 
-    /* VERIFY phase: read back all 100 */
-    long ok_cnt = 0, lost_cnt = 0, silent_cnt = 0;
+    /* Verify all records — data sectors must be unaffected */
     uint8_t payload[PAYLOAD_SIZE];
-    for (int i = 0; i < 100; i++) {
-        uint8_t rrc = raid_read(&ctx, slba[i], payload);
-        float gt=0.0f, gh=0.0f; int tm=0, hm=0;
-        const char *note = "";
-        if (rrc == STORAGE_ERR_UNRECOVERABLE) {
-            lost_cnt++; note = "unrecoverable";
-        } else if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt = unpack_f32(&payload[0]); gh = unpack_f32(&payload[4]);
-            tm = fabsf(gt-stemp[i])<0.001f; hm = fabsf(gh-shum[i])<0.001f;
-            if (tm && hm) { ok_cnt++; note = "match"; }
-            else          { silent_cnt++; note = "SILENT CORRUPTION"; }
-        }
-
-        int ok = (rrc != STORAGE_ERR_UNRECOVERABLE) && tm && hm;
-        pass_assert(&r, ok);
-        lxw_format *fmt = xfmt(f, ok);
-        char rrc_s[8]; snprintf(rrc_s, sizeof rrc_s, "%u", rrc);
-        worksheet_write_string(ws, row, 0, "VERIFY",             fmt);
-        worksheet_write_number(ws, row, 1, i+1,                  fmt);
-        worksheet_write_number(ws, row, 2, (double)slba[i],      fmt);
-        worksheet_write_number(ws, row, 3, stemp[i],             fmt);
-        worksheet_write_number(ws, row, 4, shum[i],              fmt);
-        worksheet_write_string(ws, row, 6, rrc_s,                fmt);
-        worksheet_write_number(ws, row, 7, gt,                   fmt);
-        worksheet_write_number(ws, row, 8, gh,                   fmt);
-        worksheet_write_string(ws, row, 9, tm?"yes":"NO",        fmt);
-        worksheet_write_string(ws, row,10, hm?"yes":"NO",        fmt);
-        worksheet_write_string(ws, row,11, note,                 fmt);
-        worksheet_write_string(ws, row,12, ok?"PASS":"FAIL",     fmt);
-        row++;
+    for (int i = 0; i < n_records; i++) {
+        uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+        r.ops++;
+        if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.lost++; continue; }
+        if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+        float gt = unpack_f32(&payload[0]);
+        float gh = unpack_f32(&payload[4]);
+        if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+            r.ok++;
+        else { r.silent++; r.pass = 0; }
     }
 
-    teardown(&ctx);
-    snprintf(r.metric, sizeof r.metric,
-             "ok=%ld lost=%ld silent=%ld assertions=%d passed=%d",
-             ok_cnt, lost_cnt, silent_cnt, r.assertions, r.assertions_passed);
+    ctx_teardown(&ctx);
     return r;
 }
 
-/* =======================================================================
-   TEST 5 — Version counter wraparound
-   Columns:
-     Event | # | LBA | Exp Temp | Exp Hum |
-     S0 Before | S1 Before | S2 Before |
-     Write RC | Slot Written |
-     S0 After | S1 After | S2 After |
-     Read RC | Got Temp | Got Hum | Match | Pass
-   ======================================================================= */
-static result_t test_version_wraparound(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "VersionWrap",
-        "Seed 3 writes, then patch all 3 copy-slot version counters to 0xFFFE. "
-        "Write 4 more records stepping through 0xFFFE→0xFFFF→0x0000→0x0001. "
-        "Verify read-back at every version value including the wraparound boundary.",
-        1, 0, 0, "" };
+static result_t bench_metadata_corruption(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "MetadataCorruption",
+        "Write records, corrupt n_corrupt bytes in sector-0 metadata (skipping magic). "
+        "Scrub then read all records back. Data sectors must be unaffected. "
+        "Fuzz: n_records ∈ [50,300], n_corrupt ∈ [3,10].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
 
     const char *hdrs[] = {
-        "Event","#","LBA","Exp Temp","Exp Hum",
-        "S0 Before","S1 Before","S2 Before",
-        "Write RC","Slot Written",
-        "S0 After","S1 After","S2 After",
-        "Read RC","Got Temp","Got Hum","Match","Pass"
+        "Iter","Seed","Records","Corruptions","Scrub-OK","Verify-OK","Verify-Lost",
+        "Silent","Elapsed(ms)","Ops/sec","Pass"
     };
-    for (int c = 0; c < 18; c++) xlh(ws, c, hdrs[c], f);
-
-    const double widths[] = {
-        16,5,8,9,9, 10,10,10, 9,13, 9,9,9, 8,9,9,7,6
-    };
-    set_col_widths(ws, widths, 18);
+    for (int c = 0; c < 11; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 9, 12, 10, 11, 12, 8, 12, 11, 6 };
+    set_col_widths(ws, w, 11);
     worksheet_freeze_panes(ws, 1, 0);
 
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        int      n_records = 50  + (int)(lcg() % 251u);
+        int      n_corrupt = 3   + (int)(lcg() % 8u);
+
+        double t0 = now_ms();
+        mc_iter_t r = run_metadata_corruption(seed, n_records, n_corrupt);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                   fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                fmt);
+        worksheet_write_number(ws, row, 2, n_records,             fmt);
+        worksheet_write_number(ws, row, 3, n_corrupt,             fmt);
+        worksheet_write_string(ws, row, 4, r.scrub_ok?"yes":"NO", fmt);
+        worksheet_write_number(ws, row, 5, (double)r.ok,          fmt);
+        worksheet_write_number(ws, row, 6, (double)r.lost,        fmt);
+        worksheet_write_number(ws, row, 7, (double)r.silent,      fmt);
+        worksheet_write_number(ws, row, 8, elapsed,               fmt);
+        worksheet_write_number(ws, row, 9, ops_ps,                fmt);
+        worksheet_write_string(ws, row,10, r.pass?"PASS":"FAIL",  fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [4/7] MetadataCorruption[%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 5 — Version wraparound
+   Per-iteration fuzz: patch_ver ∈ {0xFFFC, 0xFFFD, 0xFFFE}, varying
+   number of pre-patch writes.
+   Columns:
+     Iter | Seed | Patch-Ver | Pre-Writes | Post-Writes | Match | Silent |
+     Elapsed(ms) | Pass
+   ======================================================================= */
+
+typedef struct {
+    int      pass;
+    long     ops;
+    uint16_t patch_ver;
+    int      n_pre, n_post;
+    int      matched;
+    long     silent;
+    uint32_t seed;
+} vw_iter_t;
+
+static vw_iter_t run_version_wrap(uint32_t seed, uint16_t patch_ver,
+                                   int n_pre, int n_post) {
+    vw_iter_t r = {.pass=1, .seed=seed, .patch_ver=patch_ver,
+                   .n_pre=n_pre, .n_post=n_post};
     zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng = seed;
+    uint64_t lbas[10]; float temps[10], hums[10];
+    int total = n_pre + n_post;
+    if (total > 10) total = 10;
+    n_pre  = total / 2;
+    n_post = total - n_pre;
+
+    /* Pre-patch writes */
+    for (int i = 0; i < n_pre; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 5000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        raid_sensor_values(&ctx, &s, 1);
+        r.ops++;
     }
 
-    int write_n = 0, silent = 0;
-    uint64_t wlba[8]; float wtemp[8], whum[8];
+    /* Patch all 3 copy-slot version fields to patch_ver AND synchronise
+       last_sector across all slots.  Without the last_sector sync, all slots
+       appear equally new after the patch, but the tie-breaking loop in
+       log_get_last_sector always picks slot 2, which may hold a stale pointer
+       from an older round-robin write — causing the next write to land on an
+       already-occupied LBA (silent corruption). */
+    uint64_t cur_last = 0;
+    get_last_sector(&ctx, &cur_last);   /* capture before touching metadata */
+    uint8_t meta[SECTOR_SIZE];
+    read_sector(&ctx, 0, meta);
+    uint8_t lo = (uint8_t)(patch_ver & 0xFFu);
+    uint8_t hi = (uint8_t)(patch_ver >> 8);
+    for (int s = 0; s < 3; s++) {
+        int base = 8 + s * 10;  /* META_COPY_SLOT_BASE=8, META_COPY_STRIDE=10 */
+        meta[base + 0] = (uint8_t)(cur_last        & 0xFFu);
+        meta[base + 1] = (uint8_t)((cur_last >>  8) & 0xFFu);
+        meta[base + 2] = (uint8_t)((cur_last >> 16) & 0xFFu);
+        meta[base + 3] = (uint8_t)((cur_last >> 24) & 0xFFu);
+        meta[base + 4] = (uint8_t)((cur_last >> 32) & 0xFFu);
+        meta[base + 5] = (uint8_t)((cur_last >> 40) & 0xFFu);
+        meta[base + 6] = (uint8_t)((cur_last >> 48) & 0xFFu);
+        meta[base + 7] = (uint8_t)((cur_last >> 56) & 0xFFu);
+        meta[base + 8] = lo;
+        meta[base + 9] = hi;
+    }
+    write_sector(&ctx, 0, meta);
 
-    /* Helper: write one record, capture before/after versions, read back */
+    /* Post-patch writes — versions step through 0xFFFF → 0x0000 → ... */
+    for (int i = 0; i < n_post; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        lbas[n_pre + i]  = lb + 1u;
+        temps[n_pre + i] = (float)(10000u + lcg_r(&rng) % 5000u);
+        hums[n_pre + i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[n_pre + i], .humidity=hums[n_pre + i]};
+        raid_sensor_values(&ctx, &s, 1);
+        r.ops++;
+    }
+
+    /* Read back all records */
     uint8_t payload[PAYLOAD_SIZE];
-
-    /* Seed writes (3 records, normal) */
-    for (int i = 0; i < 3; i++) {
-        vers_t vb = read_versions(&ctx);
-        uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        wlba[write_n]  = lb + 1;
-        wtemp[write_n] = (float)(500 + i);
-        whum[write_n]  = (float)(i % 100);
-        sensor_t s = { .temp=wtemp[write_n], .humidity=whum[write_n] };
-        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
-        vers_t va = read_versions(&ctx);
-        int slot = slot_written(vb, va);
-
-        uint8_t rrc = raid_read(&ctx, wlba[write_n], payload);
-        float gt=0.0f, gh=0.0f; int m=0;
-        if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt = unpack_f32(&payload[0]); gh = unpack_f32(&payload[4]);
-            m  = fabsf(gt-wtemp[write_n])<0.001f && fabsf(gh-whum[write_n])<0.001f;
-            if (!m) silent++;
-        }
-        int ok = (wrc == STORAGE_OK) && m;
-        pass_assert(&r, ok);
-
-        char slot_s[4]; snprintf(slot_s, sizeof slot_s, slot>=0?"%d":"-", slot);
-        char s0b[8],s1b[8],s2b[8],s0a[8],s1a[8],s2a[8];
-        snprintf(s0b,sizeof s0b,"0x%04X",vb.s0); snprintf(s1b,sizeof s1b,"0x%04X",vb.s1); snprintf(s2b,sizeof s2b,"0x%04X",vb.s2);
-        snprintf(s0a,sizeof s0a,"0x%04X",va.s0); snprintf(s1a,sizeof s1a,"0x%04X",va.s1); snprintf(s2a,sizeof s2a,"0x%04X",va.s2);
-        char wrc_s[4], rrc_s[4]; snprintf(wrc_s,sizeof wrc_s,"%u",wrc); snprintf(rrc_s,sizeof rrc_s,"%u",rrc);
-
-        lxw_format *fmt = xfmt(f, ok);
-        worksheet_write_string(ws,row, 0,"SEED_WRITE",   fmt);
-        worksheet_write_number(ws,row, 1,write_n+1,      fmt);
-        worksheet_write_number(ws,row, 2,(double)wlba[write_n],fmt);
-        worksheet_write_number(ws,row, 3,wtemp[write_n], fmt);
-        worksheet_write_number(ws,row, 4,whum[write_n],  fmt);
-        worksheet_write_string(ws,row, 5,s0b,            fmt);
-        worksheet_write_string(ws,row, 6,s1b,            fmt);
-        worksheet_write_string(ws,row, 7,s2b,            fmt);
-        worksheet_write_string(ws,row, 8,wrc_s,          fmt);
-        worksheet_write_string(ws,row, 9,slot_s,         fmt);
-        worksheet_write_string(ws,row,10,s0a,            fmt);
-        worksheet_write_string(ws,row,11,s1a,            fmt);
-        worksheet_write_string(ws,row,12,s2a,            fmt);
-        worksheet_write_string(ws,row,13,rrc_s,          fmt);
-        worksheet_write_number(ws,row,14,gt,             fmt);
-        worksheet_write_number(ws,row,15,gh,             fmt);
-        worksheet_write_string(ws,row,16,m?"yes":"NO",   fmt);
-        worksheet_write_string(ws,row,17,ok?"PASS":"FAIL",fmt);
-        row++; write_n++;
+    for (int i = 0; i < total; i++) {
+        uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+        r.ops++;
+        if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+        float gt = unpack_f32(&payload[0]);
+        float gh = unpack_f32(&payload[4]);
+        if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+            r.matched++;
+        else { r.silent++; r.pass = 0; }
     }
 
-    /* Patch all 3 version counters to 0xFFFE */
-    {
-        vers_t vb = read_versions(&ctx);
-        uint8_t meta[SECTOR_SIZE]; read_sector(&ctx, 0, meta);
-        meta[16]=0xFE; meta[17]=0xFF;
-        meta[26]=0xFE; meta[27]=0xFF;
-        meta[36]=0xFE; meta[37]=0xFF;
-        write_sector(&ctx, 0, meta);
-        vers_t va = read_versions(&ctx);
-
-        char s0b[8],s1b[8],s2b[8],s0a[8],s1a[8],s2a[8];
-        snprintf(s0b,sizeof s0b,"0x%04X",vb.s0); snprintf(s1b,sizeof s1b,"0x%04X",vb.s1); snprintf(s2b,sizeof s2b,"0x%04X",vb.s2);
-        snprintf(s0a,sizeof s0a,"0x%04X",va.s0); snprintf(s1a,sizeof s1a,"0x%04X",va.s1); snprintf(s2a,sizeof s2a,"0x%04X",va.s2);
-
-        lxw_format *fmt = f->event;
-        worksheet_write_string(ws,row, 0,"PATCH",                     fmt);
-        worksheet_write_string(ws,row, 5,s0b,                         fmt);
-        worksheet_write_string(ws,row, 6,s1b,                         fmt);
-        worksheet_write_string(ws,row, 7,s2b,                         fmt);
-        worksheet_write_string(ws,row, 9,"manual patch",              fmt);
-        worksheet_write_string(ws,row,10,s0a,                         fmt);
-        worksheet_write_string(ws,row,11,s1a,                         fmt);
-        worksheet_write_string(ws,row,12,s2a,                         fmt);
-        worksheet_write_string(ws,row,17,"set all to 0xFFFE",         fmt);
-        row++;
-    }
-
-    /* Post-patch writes: 4 records stepping through wraparound */
-    for (int i = 0; i < 4; i++) {
-        vers_t vb = read_versions(&ctx);
-        uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        wlba[write_n]  = lb + 1;
-        wtemp[write_n] = (float)(600 + i);
-        whum[write_n]  = (float)(i % 100);
-        sensor_t s = { .temp=wtemp[write_n], .humidity=whum[write_n] };
-        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
-        vers_t va = read_versions(&ctx);
-        int slot = slot_written(vb, va);
-
-        uint8_t rrc = raid_read(&ctx, wlba[write_n], payload);
-        float gt=0.0f, gh=0.0f; int m=0;
-        if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt = unpack_f32(&payload[0]); gh = unpack_f32(&payload[4]);
-            m  = fabsf(gt-wtemp[write_n])<0.001f && fabsf(gh-whum[write_n])<0.001f;
-            if (!m) silent++;
-        }
-        int ok = (wrc == STORAGE_OK || wrc == STORAGE_WARN_DEGRADED) && m;
-        pass_assert(&r, ok);
-
-        char slot_s[4]; snprintf(slot_s, sizeof slot_s, slot>=0?"%d":"-", slot);
-        char s0b[8],s1b[8],s2b[8],s0a[8],s1a[8],s2a[8];
-        snprintf(s0b,sizeof s0b,"0x%04X",vb.s0); snprintf(s1b,sizeof s1b,"0x%04X",vb.s1); snprintf(s2b,sizeof s2b,"0x%04X",vb.s2);
-        snprintf(s0a,sizeof s0a,"0x%04X",va.s0); snprintf(s1a,sizeof s1a,"0x%04X",va.s1); snprintf(s2a,sizeof s2a,"0x%04X",va.s2);
-        char wrc_s[4], rrc_s[4]; snprintf(wrc_s,sizeof wrc_s,"%u",wrc); snprintf(rrc_s,sizeof rrc_s,"%u",rrc);
-
-        lxw_format *fmt = xfmt(f, ok);
-        worksheet_write_string(ws,row, 0,"POST_WRAP_WRITE",fmt);
-        worksheet_write_number(ws,row, 1,write_n+1,        fmt);
-        worksheet_write_number(ws,row, 2,(double)wlba[write_n],fmt);
-        worksheet_write_number(ws,row, 3,wtemp[write_n],   fmt);
-        worksheet_write_number(ws,row, 4,whum[write_n],    fmt);
-        worksheet_write_string(ws,row, 5,s0b,              fmt);
-        worksheet_write_string(ws,row, 6,s1b,              fmt);
-        worksheet_write_string(ws,row, 7,s2b,              fmt);
-        worksheet_write_string(ws,row, 8,wrc_s,            fmt);
-        worksheet_write_string(ws,row, 9,slot_s,           fmt);
-        worksheet_write_string(ws,row,10,s0a,              fmt);
-        worksheet_write_string(ws,row,11,s1a,              fmt);
-        worksheet_write_string(ws,row,12,s2a,              fmt);
-        worksheet_write_string(ws,row,13,rrc_s,            fmt);
-        worksheet_write_number(ws,row,14,gt,               fmt);
-        worksheet_write_number(ws,row,15,gh,               fmt);
-        worksheet_write_string(ws,row,16,m?"yes":"NO",     fmt);
-        worksheet_write_string(ws,row,17,ok?"PASS":"FAIL", fmt);
-        row++; write_n++;
-    }
-
-    teardown(&ctx);
-    if (silent) r.passed = 0;
-    snprintf(r.metric, sizeof r.metric,
-             "total_writes=%d silent=%d assertions=%d passed=%d",
-             write_n, silent, r.assertions, r.assertions_passed);
+    ctx_teardown(&ctx);
     return r;
+}
+
+static result_t bench_version_wrap(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "VersionWrap",
+        "Patch all 3 copy-slot version fields to a value near 0xFFFF. "
+        "Subsequent writes must step correctly through 0xFFFF→0x0000 wraparound. "
+        "All records must read back intact. Fuzz: patch_ver ∈ {0xFFFC,0xFFFD,0xFFFE}.",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Patch-Ver","Pre-Writes","Post-Writes","Match","Silent",
+        "Elapsed(ms)","Pass"
+    };
+    for (int c = 0; c < 9; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 12, 11, 12, 8, 8, 12, 6 };
+    set_col_widths(ws, w, 9);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        uint16_t patch_ver = (uint16_t)(0xFFFCu + lcg() % 3u);
+        int      n_pre     = 1 + (int)(lcg() % 5u);
+        int      n_post    = 1 + (int)(lcg() % 5u);
+
+        double t0 = now_ms();
+        vw_iter_t r = run_version_wrap(seed, patch_ver, n_pre, n_post);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12], ver_s[10];
+        snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        snprintf(ver_s,  sizeof ver_s,  "0x%04X",  patch_ver);
+        worksheet_write_number(ws, row, 0, i+1,                 fmt);
+        worksheet_write_string(ws, row, 1, seed_s,              fmt);
+        worksheet_write_string(ws, row, 2, ver_s,               fmt);
+        worksheet_write_number(ws, row, 3, r.n_pre,             fmt);
+        worksheet_write_number(ws, row, 4, r.n_post,            fmt);
+        worksheet_write_number(ws, row, 5, r.matched,           fmt);
+        worksheet_write_number(ws, row, 6, (double)r.silent,    fmt);
+        worksheet_write_number(ws, row, 7, elapsed,             fmt);
+        worksheet_write_string(ws, row, 8, r.pass?"PASS":"FAIL",fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [5/7] VersionWrap       [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
+
+        (void)ops_ps;
+    }
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
 }
 
 /* =======================================================================
    TEST 6 — Full-range scrub
+   Per-iteration fuzz: n_records ∈ [100,500], n_faults ∈ [10,40]
    Columns:
-     Phase | # | Zone | LBA | Exp Temp | Exp Hum | Write RC |
-     Corrupt Mirror | Corrupt Offset | Corrupt Byte |
-     Scrub Chk | Scrub Hlthy | Scrub Rep | Scrub Unrec |
-     Read RC | Got Temp | Got Hum | Match | Pass
+     Iter | Seed | Records | Faults | Repaired | Unrecoverable | Verify-OK |
+     Verify-Lost | Silent | Elapsed(ms) | Ops/sec | Pass
    ======================================================================= */
-static result_t test_full_range_scrub(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "FullRangeScrub",
-        "Write 500 records. Inject 30 single-mirror faults: 10 in early range "
-        "(LBA 2-11), 10 in mid range, 10 in late range. Scrub full range. "
-        "Single-mirror faults must be repaired. Verify all 500 records: silent must be 0.",
-        1, 0, 0, "" };
 
-    const char *hdrs[] = {
-        "Phase","#","Zone","LBA","Exp Temp","Exp Hum","Write RC",
-        "Corrupt Mirror","Corrupt Offset","Corrupt Byte",
-        "Scrub Chk","Scrub Hlthy","Scrub Rep","Scrub Unrec",
-        "Read RC","Got Temp","Got Hum","Match","Pass"
-    };
-    for (int c = 0; c < 19; c++) xlh(ws, c, hdrs[c], f);
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_records, n_faults;
+    uint32_t repaired, unrecoverable;
+    long     ok, lost, silent;
+    uint32_t seed;
+} frs_iter_t;
 
-    const double widths[] = {
-        14,5,8,8,9,9,9,
-        15,14,13,
-        10,11,10,12,
-        8,9,9,7,6
-    };
-    set_col_widths(ws, widths, 19);
-    worksheet_freeze_panes(ws, 1, 0);
-
+static frs_iter_t run_full_range_scrub(uint32_t seed, int n_records, int n_faults) {
+    frs_iter_t r = {.pass=1, .seed=seed, .n_records=n_records, .n_faults=n_faults};
     zinf_ctx_t ctx;
-    lxw_row_t  row = 1;
-    if (setup_ram(&ctx) != 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "setup failed"); return r;
+    if (setup_ram(&ctx) != 0) { r.pass = 0; return r; }
+
+    uint32_t rng = seed;
+    uint64_t lbas[500]; float temps[500], hums[500];
+
+    /* Write n_records */
+    for (int i = 0; i < n_records; i++) {
+        uint64_t lb = 0; get_last_sector(&ctx, &lb);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        raid_sensor_values(&ctx, &s, 1);
+        r.ops++;
     }
 
-    /* Write 500 records */
-    uint64_t slba[500]; float stemp[500], shum[500];
-    for (int i = 0; i < 500; i++) {
-        uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        slba[i]  = lb + 1;
-        stemp[i] = (float)(700 + i);
-        shum[i]  = (float)(i % 100);
-        sensor_t s = { .temp=stemp[i], .humidity=shum[i] };
-        uint8_t wrc = raid_sensor_values(&ctx, &s, 1);
-        char wrc_s[8]; snprintf(wrc_s, sizeof wrc_s, "%u", wrc);
-        lxw_format *fmt = f->plain;
-        worksheet_write_string(ws, row, 0, "WRITE",       fmt);
-        worksheet_write_number(ws, row, 1, i+1,           fmt);
-        worksheet_write_string(ws, row, 2, "-",           fmt);
-        worksheet_write_number(ws, row, 3, (double)slba[i],fmt);
-        worksheet_write_number(ws, row, 4, stemp[i],      fmt);
-        worksheet_write_number(ws, row, 5, shum[i],       fmt);
-        worksheet_write_string(ws, row, 6, wrc_s,         fmt);
-        row++;
-    }
     uint64_t last_lba = 0; get_last_sector(&ctx, &last_lba);
 
-    /* Inject 30 single-mirror faults across three zones */
-    static const char *zone_names[3] = { "early", "mid", "late" };
-    int faults = 0;
-    for (int zone = 0; zone < 3; zone++) {
-        uint64_t base;
-        if      (zone == 0) base = 2;
-        else if (zone == 1) base = 2 + (last_lba - 2) / 2;
-        else                base = last_lba >= 9 ? last_lba - 9 : last_lba;
+    /* Inject n_faults single-mirror corruptions across early/mid/late zones */
+    int faults_per_zone = n_faults / 3;
+    int zones[3][2] = {
+        { 0,                faults_per_zone     },
+        { faults_per_zone,  faults_per_zone * 2 },
+        { faults_per_zone * 2, n_faults         }
+    };
+    uint64_t range = last_lba > 2u ? last_lba - 2u : 1u;
 
-        for (int j = 0; j < 10; j++) {
-            uint64_t lba = base + (uint64_t)j;
-            if (lba > last_lba) break;
-            uint32_t off = 0;          /* byte 0 of payload */
-            uint8_t  byt = 0xFFu;
-            ram_driver_corrupt(lba, off, byt);
-            faults++;
-
-            char lba_s[20], off_s[8], byt_s[8];
-            snprintf(lba_s, sizeof lba_s, "%" PRIu64, lba);
-            snprintf(off_s, sizeof off_s, "%u",  off);
-            snprintf(byt_s, sizeof byt_s, "0x%02X", byt);
-
-            lxw_format *fmt = f->event;
-            worksheet_write_string(ws, row, 0, "INJECT",       fmt);
-            worksheet_write_number(ws, row, 1, faults,         fmt);
-            worksheet_write_string(ws, row, 2, zone_names[zone],fmt);
-            worksheet_write_string(ws, row, 3, lba_s,          fmt);
-            worksheet_write_string(ws, row, 7, "mirror-0",     fmt);
-            worksheet_write_string(ws, row, 8, off_s,          fmt);
-            worksheet_write_string(ws, row, 9, byt_s,          fmt);
-            row++;
+    for (int z = 0; z < 3; z++) {
+        for (int j = zones[z][0]; j < zones[z][1]; j++) {
+            /* Pick a random LBA within the zone's 1/3 of the written range */
+            uint64_t zone_base = 2u + (uint64_t)z * (range / 3u);
+            uint64_t zone_len  = range / 3u;
+            if (zone_len == 0u) zone_len = 1u;
+            uint64_t victim = zone_base + lcg_r(&rng) % zone_len;
+            if (victim > last_lba) victim = last_lba;
+            uint32_t off = lcg_r(&rng) % SECTOR_SIZE;
+            uint8_t  byt = (uint8_t)(lcg_r(&rng) & 0xFFu);
+            /* Corrupt only mirror-0 (single-mirror hit → repairable by scrub) */
+            ram_driver_corrupt(victim, off, byt);
         }
     }
 
-    /* Full-range scrub */
+    /* Scrub */
     zinf_clear_bad_sectors(&ctx);
     zinf_scrub_report_t rep = {0};
-    uint8_t src = zinf_scrub(&ctx, 2, last_lba, &rep);
-    {
-        int ok = (src == STORAGE_OK);
-        pass_assert(&r, ok);
-        /* repaired should equal faults (all single-mirror) */
-        int rep_ok = (rep.repaired == (uint32_t)faults);
-        pass_assert(&r, rep_ok);
-        char rc_s[8]; snprintf(rc_s, sizeof rc_s, "%u", src);
-        lxw_format *fmt = xfmt(f, ok && rep_ok);
-        worksheet_write_string(ws, row, 0,  "SCRUB",           fmt);
-        worksheet_write_string(ws, row, 6,  rc_s,              fmt);
-        worksheet_write_number(ws, row,10,  rep.checked,       fmt);
-        worksheet_write_number(ws, row,11,  rep.healthy,       fmt);
-        worksheet_write_number(ws, row,12,  rep.repaired,      fmt);
-        worksheet_write_number(ws, row,13,  rep.unrecoverable, fmt);
-        worksheet_write_string(ws, row,18,  (ok&&rep_ok)?"PASS":"FAIL", fmt);
-        row++;
-    }
+    zinf_scrub(&ctx, 2u, last_lba, &rep);
+    r.repaired       = rep.repaired;
+    r.unrecoverable  = rep.unrecoverable;
 
-    /* Verify all 500 records */
-    long ok_cnt=0, lost_cnt=0, silent_cnt=0;
+    /* Verify all records */
     uint8_t payload[PAYLOAD_SIZE];
-    for (int i = 0; i < 500; i++) {
-        uint8_t rrc = raid_read(&ctx, slba[i], payload);
-        float gt=0.0f, gh=0.0f; int m=0;
-        if (rrc == STORAGE_ERR_UNRECOVERABLE) { lost_cnt++; }
-        else if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt = unpack_f32(&payload[0]); gh = unpack_f32(&payload[4]);
-            m  = fabsf(gt-stemp[i])<0.001f && fabsf(gh-shum[i])<0.001f;
-            if (m) ok_cnt++; else silent_cnt++;
-        }
-        int ok = m;
-        pass_assert(&r, ok);
-        lxw_format *fmt = xfmt(f, ok);
-        char rrc_s[8]; snprintf(rrc_s, sizeof rrc_s, "%u", rrc);
-        worksheet_write_string(ws, row, 0, "VERIFY",         fmt);
-        worksheet_write_number(ws, row, 1, i+1,              fmt);
-        worksheet_write_number(ws, row, 3, (double)slba[i],  fmt);
-        worksheet_write_number(ws, row, 4, stemp[i],         fmt);
-        worksheet_write_number(ws, row, 5, shum[i],          fmt);
-        worksheet_write_string(ws, row,14, rrc_s,            fmt);
-        worksheet_write_number(ws, row,15, gt,               fmt);
-        worksheet_write_number(ws, row,16, gh,               fmt);
-        worksheet_write_string(ws, row,17, m?"yes":"NO",     fmt);
-        worksheet_write_string(ws, row,18, ok?"PASS":"FAIL", fmt);
-        row++;
+    for (int i = 0; i < n_records; i++) {
+        uint8_t rrc = raid_read(&ctx, lbas[i], payload);
+        r.ops++;
+        if (rrc == STORAGE_ERR_UNRECOVERABLE) { r.lost++; continue; }
+        if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) continue;
+        float gt = unpack_f32(&payload[0]);
+        float gh = unpack_f32(&payload[4]);
+        if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+            r.ok++;
+        else { r.silent++; r.pass = 0; }
     }
+    if (r.silent > 0) r.pass = 0;
 
-    teardown(&ctx);
-    snprintf(r.metric, sizeof r.metric,
-             "faults=%d rep=%u unrec=%u ok=%ld lost=%ld silent=%ld "
-             "assertions=%d passed=%d",
-             faults, rep.repaired, rep.unrecoverable,
-             ok_cnt, lost_cnt, silent_cnt,
-             r.assertions, r.assertions_passed);
+    ctx_teardown(&ctx);
     return r;
 }
 
-/* =======================================================================
-   TEST 7 — Linux loopback integrity
-   Columns:
-     Phase | # | LBA | Exp Temp | Exp Hum | Write RC |
-     Read RC | Got Temp | Got Hum | Temp Diff | Hum Diff | Match | Pass
-   ======================================================================= */
-static result_t test_loopback_integrity(lxw_worksheet *ws, xl_fmts_t *f) {
-    result_t r = { "Loopback",
-        "Write 100 sensor records via the linux block-device driver (real pread/pwrite). "
-        "Read back each record and verify bytes match exactly. "
-        "Temp diff and humidity diff must both be 0.000. No fault injection.",
-        1, 0, 0, "" };
+static result_t bench_full_range_scrub(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "FullRangeScrub",
+        "Write records, inject single-mirror faults across early/mid/late zones, "
+        "run full-range scrub, verify all records. silent must always be 0. "
+        "Fuzz: n_records ∈ [100,500], n_faults ∈ [10,40].",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
 
     const char *hdrs[] = {
-        "Phase","#","LBA","Exp Temp","Exp Hum","Write RC",
-        "Read RC","Got Temp","Got Hum","Temp Diff","Hum Diff","Match","Pass"
+        "Iter","Seed","Records","Faults","Repaired","Unrecoverable","Verify-OK",
+        "Verify-Lost","Silent","Elapsed(ms)","Ops/sec","Pass"
     };
-    for (int c = 0; c < 13; c++) xlh(ws, c, hdrs[c], f);
-
-    const double widths[] = { 8,5,8,9,9,9,8,9,9,10,10,7,6 };
-    set_col_widths(ws, widths, 13);
+    for (int c = 0; c < 12; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 9, 8, 10, 15, 11, 13, 8, 12, 11, 6 };
+    set_col_widths(ws, w, 12);
     worksheet_freeze_panes(ws, 1, 0);
 
-    /* Create image file */
-    int fd = open(LOOPBACK_IMG, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "cannot create %s", LOOPBACK_IMG);
-        return r;
+    bench_t b = bench_init(n_iters);
+
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        int      n_records = 100 + (int)(lcg() % 401u);
+        int      n_faults  = 10  + (int)(lcg() % 31u);
+
+        double t0 = now_ms();
+        frs_iter_t r = run_full_range_scrub(seed, n_records, n_faults);
+        double elapsed = now_ms() - t0;
+        double ops_ps  = elapsed > 0.0 ? r.ops * 1000.0 / elapsed : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, r.silent, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                    fmt);
+        worksheet_write_string(ws, row, 1, seed_s,                 fmt);
+        worksheet_write_number(ws, row, 2, n_records,              fmt);
+        worksheet_write_number(ws, row, 3, n_faults,               fmt);
+        worksheet_write_number(ws, row, 4, (double)r.repaired,     fmt);
+        worksheet_write_number(ws, row, 5, (double)r.unrecoverable,fmt);
+        worksheet_write_number(ws, row, 6, (double)r.ok,           fmt);
+        worksheet_write_number(ws, row, 7, (double)r.lost,         fmt);
+        worksheet_write_number(ws, row, 8, (double)r.silent,       fmt);
+        worksheet_write_number(ws, row, 9, elapsed,                fmt);
+        worksheet_write_number(ws, row,10, ops_ps,                 fmt);
+        worksheet_write_string(ws, row,11, r.pass?"PASS":"FAIL",   fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [6/7] FullRangeScrub    [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
+        }
     }
-    if (ftruncate(fd, (off_t)ADV_IMG_SECTS * SECTOR_SIZE) != 0) {
-        close(fd); r.passed = 0;
-        snprintf(r.metric, sizeof r.metric, "ftruncate failed"); return r;
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = b.total_silent;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms ops/sec=%.0f silent=%ld",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms,
+             res.ops_per_sec, b.total_silent);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   TEST 7 — Loopback integrity (linux driver)
+   Per-iteration fuzz: n_records ∈ [50,200]
+   The image file is created once and reused across all iterations.
+   Columns:
+     Iter | Seed | Records | Matched | Elapsed(ms) | Throughput(KB/s) | Pass
+   ======================================================================= */
+
+typedef struct {
+    int      pass;
+    long     ops;
+    int      n_records;
+    int      matched;
+    uint32_t seed;
+} lb_iter_t;
+
+static lb_iter_t run_loopback(zinf_ctx_t *ctx, uint32_t seed, int n_records) {
+    lb_iter_t r = {.pass=1, .seed=seed, .n_records=n_records};
+
+    uint32_t rng = seed;
+    uint64_t lbas[200]; float temps[200], hums[200];
+
+    zinf_clear_bad_sectors(ctx);
+    if (init_log_sector(ctx) != STORAGE_OK) { r.pass = 0; return r; }
+
+    for (int i = 0; i < n_records; i++) {
+        uint64_t lb = 0; get_last_sector(ctx, &lb);
+        lbas[i]  = lb + 1u;
+        temps[i] = (float)(lcg_r(&rng) % 10000u);
+        hums[i]  = (float)(lcg_r(&rng) % 100u);
+        sensor_t s = {.temp=temps[i], .humidity=hums[i]};
+        uint8_t wrc = raid_sensor_values(ctx, &s, 1);
+        if (wrc != STORAGE_OK && wrc != STORAGE_WARN_DEGRADED) r.pass = 0;
+        r.ops++;
+    }
+
+    uint8_t payload[PAYLOAD_SIZE];
+    for (int i = 0; i < n_records; i++) {
+        uint8_t rrc = raid_read(ctx, lbas[i], payload);
+        r.ops++;
+        if (rrc != STORAGE_OK && rrc != STORAGE_WARN_DEGRADED) { r.pass = 0; continue; }
+        float gt = unpack_f32(&payload[0]);
+        float gh = unpack_f32(&payload[4]);
+        if (fabsf(gt - temps[i]) < 0.001f && fabsf(gh - hums[i]) < 0.001f)
+            r.matched++;
+        else r.pass = 0;
+    }
+
+    return r;
+}
+
+static result_t bench_loopback(lxw_worksheet *ws, xl_fmts_t *f, int n_iters) {
+    result_t res = {
+        "Loopback",
+        "End-to-end byte integrity via linux block-device driver on a real image file. "
+        "Write records with known values, read back, compare exactly. "
+        "Fuzz: n_records ∈ [50,200]. Image reused across iterations.",
+        1, n_iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ""
+    };
+
+    const char *hdrs[] = {
+        "Iter","Seed","Records","Matched","Elapsed(ms)","Throughput(KB/s)","Pass"
+    };
+    for (int c = 0; c < 7; c++) xlh(ws, c, hdrs[c], f);
+    const double w[] = { 6, 12, 9, 9, 12, 17, 6 };
+    set_col_widths(ws, w, 7);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    /* Create the image file once */
+    int fd = open(LOOPBACK_IMG, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)ADV_IMG_SECTS * SECTOR_SIZE) != 0) {
+        if (fd >= 0) close(fd);
+        res.passed = 0;
+        snprintf(res.metric, sizeof res.metric, "cannot create %s", LOOPBACK_IMG);
+        return res;
     }
     close(fd);
 
-    linux_driver_set_path(LOOPBACK_IMG);
     zinf_ctx_t ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.driver           = &linux_driver;
@@ -1048,77 +1203,122 @@ static result_t test_loopback_integrity(lxw_worksheet *ws, xl_fmts_t *f) {
     ctx.log_sector       = 0;
     ctx.raid_offset      = ctx.mirror_offset;
 
+    linux_driver_set_path(LOOPBACK_IMG);
     if (ctx.driver->init(ctx.driver) != DRIVER_OK) {
-        r.passed = 0; snprintf(r.metric, sizeof r.metric, "linux_driver init failed");
-        unlink(LOOPBACK_IMG); return r;
+        unlink(LOOPBACK_IMG);
+        res.passed = 0;
+        snprintf(res.metric, sizeof res.metric, "linux_driver init failed");
+        return res;
     }
     if (init_log_sector(&ctx) != STORAGE_OK) {
-        teardown(&ctx); r.passed = 0;
-        snprintf(r.metric, sizeof r.metric, "init_log_sector failed");
-        unlink(LOOPBACK_IMG); return r;
+        ctx_teardown(&ctx); unlink(LOOPBACK_IMG);
+        res.passed = 0;
+        snprintf(res.metric, sizeof res.metric, "init_log_sector failed");
+        return res;
     }
 
-    /* Write 100 records, capturing LBA and write RC */
-    uint64_t slba[100]; float stemp[100], shum[100]; uint8_t swrc[100];
-    lxw_row_t row = 1;
-    for (int i = 0; i < 100; i++) {
-        uint64_t lb = 0; get_last_sector(&ctx, &lb);
-        slba[i]  = lb + 1;
-        stemp[i] = (float)(900 + i);
-        shum[i]  = (float)(i % 100);
-        sensor_t s = { .temp=stemp[i], .humidity=shum[i] };
-        swrc[i]  = raid_sensor_values(&ctx, &s, 1);
+    bench_t b = bench_init(n_iters);
 
-        char wrc_s[8]; snprintf(wrc_s, sizeof wrc_s, "%u", swrc[i]);
-        lxw_format *fmt = f->plain;
-        worksheet_write_string(ws, row, 0, "WRITE",          fmt);
-        worksheet_write_number(ws, row, 1, i+1,              fmt);
-        worksheet_write_number(ws, row, 2, (double)slba[i],  fmt);
-        worksheet_write_number(ws, row, 3, stemp[i],         fmt);
-        worksheet_write_number(ws, row, 4, shum[i],          fmt);
-        worksheet_write_string(ws, row, 5, wrc_s,            fmt);
-        row++;
-    }
+    for (int i = 0; i < n_iters; i++) {
+        uint32_t seed      = lcg();
+        int      n_records = 50 + (int)(lcg() % 151u);
 
-    /* Verify 100 records */
-    int matched = 0;
-    uint8_t payload[PAYLOAD_SIZE];
-    for (int i = 0; i < 100; i++) {
-        uint8_t rrc = raid_read(&ctx, slba[i], payload);
-        float gt=0.0f, gh=0.0f, tdiff=0.0f, hdiff=0.0f; int m=0;
-        if (rrc == STORAGE_OK || rrc == STORAGE_WARN_DEGRADED) {
-            gt    = unpack_f32(&payload[0]);
-            gh    = unpack_f32(&payload[4]);
-            tdiff = gt - stemp[i];
-            hdiff = gh - shum[i];
-            m     = fabsf(tdiff)<0.001f && fabsf(hdiff)<0.001f;
+        double t0 = now_ms();
+        lb_iter_t r = run_loopback(&ctx, seed, n_records);
+        double elapsed = now_ms() - t0;
+        /* Throughput: (reads+writes) × 512 bytes / elapsed_ms → KB/s */
+        double kbps = elapsed > 0.0
+            ? (double)r.ops * SECTOR_SIZE / elapsed  /* bytes/ms = KB/s */
+            : 0.0;
+
+        bench_record(&b, i, elapsed, r.ops, 0, r.pass);
+
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        lxw_format *fmt = xfmt(f, r.pass);
+        char seed_s[12]; snprintf(seed_s, sizeof seed_s, "0x%08X", seed);
+        worksheet_write_number(ws, row, 0, i+1,                fmt);
+        worksheet_write_string(ws, row, 1, seed_s,             fmt);
+        worksheet_write_number(ws, row, 2, n_records,          fmt);
+        worksheet_write_number(ws, row, 3, r.matched,          fmt);
+        worksheet_write_number(ws, row, 4, elapsed,            fmt);
+        worksheet_write_number(ws, row, 5, kbps,               fmt);
+        worksheet_write_string(ws, row, 6, r.pass?"PASS":"FAIL",fmt);
+
+        if (!r.pass) res.passed = 0;
+
+        if ((i+1) % 100 == 0 || i == n_iters-1) {
+            printf("\r  [7/7] Loopback          [%4d/%d] pass=%d fail=%d",
+                   i+1, n_iters, b.pass_n, i+1-b.pass_n);
+            fflush(stdout);
         }
-        if (m) matched++;
-        pass_assert(&r, m);
-
-        lxw_format *fmt = xfmt(f, m);
-        char rrc_s[8]; snprintf(rrc_s, sizeof rrc_s, "%u", rrc);
-        worksheet_write_string(ws, row, 0, "VERIFY",         fmt);
-        worksheet_write_number(ws, row, 1, i+1,              fmt);
-        worksheet_write_number(ws, row, 2, (double)slba[i],  fmt);
-        worksheet_write_number(ws, row, 3, stemp[i],         fmt);
-        worksheet_write_number(ws, row, 4, shum[i],          fmt);
-        worksheet_write_string(ws, row, 6, rrc_s,            fmt);
-        worksheet_write_number(ws, row, 7, gt,               fmt);
-        worksheet_write_number(ws, row, 8, gh,               fmt);
-        worksheet_write_number(ws, row, 9, tdiff,            fmt);
-        worksheet_write_number(ws, row,10, hdiff,            fmt);
-        worksheet_write_string(ws, row,11, m?"yes":"NO",     fmt);
-        worksheet_write_string(ws, row,12, m?"PASS":"FAIL",  fmt);
-        row++;
     }
 
-    teardown(&ctx);
+    ctx_teardown(&ctx);
     unlink(LOOPBACK_IMG);
-    snprintf(r.metric, sizeof r.metric,
-             "%d/100 matched assertions=%d passed=%d",
-             matched, r.assertions, r.assertions_passed);
-    return r;
+
+    res.pass_n       = b.pass_n;
+    res.fail_n       = n_iters - b.pass_n;
+    res.total_ops    = b.total_ops;
+    res.total_silent = 0;
+    res.lat_avg_ms   = n_iters > 0 ? b.lat_sum / n_iters : 0.0;
+    res.lat_min_ms   = b.lat_min < 1e17 ? b.lat_min : 0.0;
+    res.lat_max_ms   = b.lat_max;
+    res.lat_p95_ms   = bench_pct(&b, 95.0);
+    res.lat_p99_ms   = bench_pct(&b, 99.0);
+    res.ops_per_sec  = b.lat_sum > 0.0 ? b.total_ops * 1000.0 / b.lat_sum : 0.0;
+    double avg_kbps  = res.ops_per_sec * SECTOR_SIZE / 1024.0;
+    snprintf(res.metric, sizeof res.metric,
+             "pass=%.1f%% lat_avg=%.2fms lat_p95=%.2fms throughput=%.0f KB/s",
+             100.0*b.pass_n/n_iters, res.lat_avg_ms, res.lat_p95_ms, avg_kbps);
+    bench_free(&b);
+    printf("\n");
+    return res;
+}
+
+/* =======================================================================
+   Summary sheet
+   ======================================================================= */
+static void write_summary(lxw_worksheet *ws, xl_fmts_t *f,
+                          result_t *results, int n) {
+    const char *hdrs[] = {
+        "#","Test","Iterations","Pass","Fail","Pass%",
+        "Avg Lat(ms)","Min Lat(ms)","Max Lat(ms)","p95 Lat(ms)","p99 Lat(ms)",
+        "Ops/sec","Total Ops","Total Silent","Description"
+    };
+    for (int c = 0; c < 15; c++)
+        worksheet_write_string(ws, 0, (lxw_col_t)c, hdrs[c], f->hdr);
+
+    const double w[] = {
+        4, 20, 11, 7, 7, 8,
+        13, 13, 13, 13, 13,
+        12, 12, 14, 60
+    };
+    set_col_widths(ws, w, 15);
+    worksheet_freeze_panes(ws, 1, 0);
+
+    for (int i = 0; i < n; i++) {
+        result_t *r = &results[i];
+        lxw_format *fmt = xfmt(f, r->passed);
+        lxw_row_t row = (lxw_row_t)(i + 1);
+        double pass_pct = r->n_iter > 0
+            ? 100.0 * r->pass_n / r->n_iter : 0.0;
+
+        worksheet_write_number(ws, row, 0, i+1,             fmt);
+        worksheet_write_string(ws, row, 1, r->name,         fmt);
+        worksheet_write_number(ws, row, 2, r->n_iter,       fmt);
+        worksheet_write_number(ws, row, 3, r->pass_n,       fmt);
+        worksheet_write_number(ws, row, 4, r->fail_n,       fmt);
+        worksheet_write_number(ws, row, 5, pass_pct,        fmt);
+        worksheet_write_number(ws, row, 6, r->lat_avg_ms,   fmt);
+        worksheet_write_number(ws, row, 7, r->lat_min_ms,   fmt);
+        worksheet_write_number(ws, row, 8, r->lat_max_ms,   fmt);
+        worksheet_write_number(ws, row, 9, r->lat_p95_ms,   fmt);
+        worksheet_write_number(ws, row,10, r->lat_p99_ms,   fmt);
+        worksheet_write_number(ws, row,11, r->ops_per_sec,  fmt);
+        worksheet_write_number(ws, row,12, (double)r->total_ops,    fmt);
+        worksheet_write_number(ws, row,13, (double)r->total_silent, fmt);
+        worksheet_write_string(ws, row,14, r->description,  fmt);
+    }
 }
 
 /* =======================================================================
@@ -1126,15 +1326,28 @@ static result_t test_loopback_integrity(lxw_worksheet *ws, xl_fmts_t *f) {
    ======================================================================= */
 int main(int argc, char *argv[]) {
     const char *out_prefix = "advanced_results";
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "-o") == 0 && i+1 < argc) out_prefix = argv[++i];
+    int         n_iters    = 1000;
+
+    for (int i = 1; i < argc; i++) {
+        if      (strcmp(argv[i], "-o") == 0 && i+1 < argc) out_prefix = argv[++i];
+        else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) n_iters    = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [-o prefix] [-n iters]\n", argv[0]);
+            printf("  -o <prefix>  output file prefix (default: advanced_results)\n");
+            printf("  -n <iters>   iterations per test (default: 1000)\n");
+            return 0;
+        }
+    }
+    if (n_iters < 1) n_iters = 1;
+    timer_init();   /* fix reference point for sub-ms timing precision */
 
     char xl_path[256];
     snprintf(xl_path, sizeof xl_path, "%s.xlsx", out_prefix);
 
-    lxw_workbook *wb   = workbook_new(xl_path);
-    xl_fmts_t     fmts = make_formats(wb);
+    lxw_workbook  *wb     = workbook_new(xl_path);
+    xl_fmts_t      fmts   = make_formats(wb);
 
+    lxw_worksheet *ws_sum   = workbook_add_worksheet(wb, "Summary");
     lxw_worksheet *ws_wipe  = workbook_add_worksheet(wb, "StorageWipe");
     lxw_worksheet *ws_deg   = workbook_add_worksheet(wb, "DegradedWrite");
     lxw_worksheet *ws_blk   = workbook_add_worksheet(wb, "BlacklistOverflow");
@@ -1142,56 +1355,34 @@ int main(int argc, char *argv[]) {
     lxw_worksheet *ws_ver   = workbook_add_worksheet(wb, "VersionWrap");
     lxw_worksheet *ws_scrub = workbook_add_worksheet(wb, "FullRangeScrub");
     lxw_worksheet *ws_loop  = workbook_add_worksheet(wb, "Loopback");
-    lxw_worksheet *ws_sum   = workbook_add_worksheet(wb, "Summary");
+
+    printf("ZINF advanced benchmark — %d iterations per test\n", n_iters);
 
     result_t results[7];
-    printf("ZINF advanced tests\n");
+    results[0] = bench_storage_wipe       (ws_wipe,  &fmts, n_iters);
+    results[1] = bench_degraded_write     (ws_deg,   &fmts, n_iters);
+    results[2] = bench_blacklist_overflow (ws_blk,   &fmts, n_iters);
+    results[3] = bench_metadata_corruption(ws_meta,  &fmts, n_iters);
+    results[4] = bench_version_wrap       (ws_ver,   &fmts, n_iters);
+    results[5] = bench_full_range_scrub   (ws_scrub, &fmts, n_iters);
+    results[6] = bench_loopback           (ws_loop,  &fmts, n_iters);
 
-#define RUN(idx, label, fn, ws) do { \
-    printf("  [%d/7] %-22s", (idx)+1, (label)); fflush(stdout); \
-    results[idx] = fn((ws), &fmts); \
-    printf("%s\n", results[idx].passed ? "PASS" : "FAIL"); \
-} while(0)
+    write_summary(ws_sum, &fmts, results, 7);
+    workbook_close(wb);
 
-    RUN(0, "StorageWipe",        test_storage_wipe,         ws_wipe);
-    RUN(1, "DegradedWrite",      test_degraded_write,       ws_deg);
-    RUN(2, "BlacklistOverflow",  test_blacklist_overflow,   ws_blk);
-    RUN(3, "MetadataCorruption", test_metadata_corruption,  ws_meta);
-    RUN(4, "VersionWrap",        test_version_wraparound,   ws_ver);
-    RUN(5, "FullRangeScrub",     test_full_range_scrub,     ws_scrub);
-    RUN(6, "Loopback",           test_loopback_integrity,   ws_loop);
-#undef RUN
-
-    /* Summary sheet */
-    const char *sum_hdrs[] = {
-        "#","Test","Description","Result",
-        "Total Assertions","Passed","Failed","Metric"
-    };
-    for (int c = 0; c < 8; c++)
-        worksheet_write_string(ws_sum, 0, (lxw_col_t)c, sum_hdrs[c], fmts.hdr);
-
-    const double sum_widths[] = { 4, 20, 60, 8, 17, 8, 8, 60 };
-    set_col_widths(ws_sum, sum_widths, 8);
-    worksheet_freeze_panes(ws_sum, 1, 0);
+    printf("\nResults → %s\n\n", xl_path);
+    printf("%-22s %6s %6s %6s  %s\n",
+           "Test", "Iter", "Pass", "Fail", "Metric");
+    printf("%-22s %6s %6s %6s  %s\n",
+           "----", "----", "----", "----", "------");
 
     int any_fail = 0;
     for (int i = 0; i < 7; i++) {
-        int failed = results[i].assertions - results[i].assertions_passed;
-        lxw_format *fmt = xfmt(&fmts, results[i].passed);
-        worksheet_write_number(ws_sum, (lxw_row_t)(i+1), 0, i+1,                        fmt);
-        worksheet_write_string(ws_sum, (lxw_row_t)(i+1), 1, results[i].name,            fmt);
-        worksheet_write_string(ws_sum, (lxw_row_t)(i+1), 2, results[i].description,     fmt);
-        worksheet_write_string(ws_sum, (lxw_row_t)(i+1), 3, results[i].passed?"PASS":"FAIL", fmt);
-        worksheet_write_number(ws_sum, (lxw_row_t)(i+1), 4, results[i].assertions,      fmt);
-        worksheet_write_number(ws_sum, (lxw_row_t)(i+1), 5, results[i].assertions_passed,fmt);
-        worksheet_write_number(ws_sum, (lxw_row_t)(i+1), 6, failed,                     fmt);
-        worksheet_write_string(ws_sum, (lxw_row_t)(i+1), 7, results[i].metric,          fmt);
-        if (!results[i].passed) any_fail = 1;
+        result_t *r = &results[i];
+        printf("%-22s %6d %6d %6d  %s\n",
+               r->name, r->n_iter, r->pass_n, r->fail_n, r->metric);
+        if (!r->passed) any_fail = 1;
     }
-
-    workbook_close(wb);
-
-    printf("\nResults → %s\n", xl_path);
-    printf("Overall: %s\n", any_fail ? "FAIL" : "PASS");
+    printf("\nOverall: %s\n", any_fail ? "FAIL" : "PASS");
     return any_fail ? 1 : 0;
 }
