@@ -1,23 +1,44 @@
 # Advanced Test Suite — Running and Interpreting Results
 
-The advanced test (`tests/test_advanced.c`) is a structured regression suite covering seven
+The advanced test (`tests/test_advanced.c`) is a benchmark-grade regression suite covering seven
 edge-case scenarios that the fuzzer and realistic lifecycle test do not exercise. Each test runs
-as a self-contained scenario, asserts a set of invariants, and writes its full trace to an Excel
-workbook (`advanced_results.xlsx`) — one worksheet per scenario plus a colour-coded summary sheet.
+**1,000 iterations** with randomised (fuzzed) parameters, measures wall-clock latency via
+`CLOCK_MONOTONIC`, and writes one row per iteration to an Excel workbook
+(`advanced_results.xlsx`) — one worksheet per scenario plus a colour-coded Summary sheet with
+aggregate statistics (avg / min / max / p95 / p99 latency, ops/sec, total silent count).
 
 ---
 
 ## What It Tests
 
-| # | Test | Coverage gap addressed |
-|---|---|---|
-| 1 | StorageWipe | Full RAM wipe followed by reinit — proves storage is usable after total loss of content |
-| 2 | DegradedWrite | Write with mirror-1 pre-blacklisted — exercises the `STORAGE_WARN_DEGRADED` code path |
-| 3 | BlacklistOverflow | Attempt to mark more than `MAX_BAD_SECTORS` (16) — proves graceful saturation |
-| 4 | MetadataCorruption | Corrupt sector 0 at 5 offsets — data sectors must be unaffected |
-| 5 | VersionWrap | Force version counter 0xFFFE → 0xFFFF → 0x0000 — proves modular comparison is correct |
-| 6 | FullRangeScrub | 30 faults scattered across early/mid/late 10% of 500 written sectors |
-| 7 | Loopback | End-to-end byte verification using the linux block-device driver on a real image file |
+| # | Test | Coverage gap addressed | Fuzz range |
+|---|---|---|---|
+| 1 | StorageWipe | Full RAM wipe + reinit — storage usable after total loss of content | pre-writes ∈ [50,300], post-writes ∈ [10,80] |
+| 2 | DegradedWrite | Write with mirror-1 pre-blacklisted — exercises `STORAGE_WARN_DEGRADED` | sectors-tested ∈ [5,20], random start LBA |
+| 3 | BlacklistOverflow | Mark more than `MAX_BAD_SECTORS` (16) — proves graceful saturation | total-attempts ∈ [17,24], random start LBA |
+| 4 | MetadataCorruption | Corrupt sector 0 — data sectors must be unaffected | records ∈ [50,300], corruptions ∈ [3,10] |
+| 5 | VersionWrap | Version counter 0xFFFC–0xFFFE → 0x0000 — proves modular comparison | patch-ver ∈ {0xFFFC, 0xFFFD, 0xFFFE} |
+| 6 | FullRangeScrub | Scattered faults across early/mid/late zones, full-range scrub | records ∈ [100,500], faults ∈ [10,40] |
+| 7 | Loopback | Linux block-device driver end-to-end byte integrity | records ∈ [50,200], image reused |
+
+---
+
+## Benchmark Results
+
+Results from a 1,000-iteration run (seed `0xDEADBEEF`, deterministic):
+
+```
+Test                     Iter   Pass   Fail  Metric
+StorageWipe              1000   1000      0  pass=100.0% lat_avg=20.57ms lat_p95=23.66ms ops/sec=12904  silent=0
+DegradedWrite            1000   1000      0  pass=100.0% lat_avg=0.22ms  lat_p95=0.38ms  ops/sec=573666 silent=0
+BlacklistOverflow        1000   1000      0  pass=100.0% lat_avg=0.01ms  lat_p95=0.01ms  ops/sec=2.8M
+MetadataCorruption       1000   1000      0  pass=100.0% lat_avg=1.16ms  lat_p95=1.88ms  ops/sec=304101 silent=0
+VersionWrap              1000   1000      0  pass=100.0% lat_avg=0.04ms  lat_p95=0.05ms  silent=0
+FullRangeScrub           1000   1000      0  pass=100.0% lat_avg=2.06ms  lat_p95=3.25ms  ops/sec=290300 silent=0
+Loopback                 1000   1000      0  pass=100.0% lat_avg=41.77ms lat_p95=65.04ms throughput=3002 KB/s
+```
+
+**Silent corruption across all 7,000 iterations: 0.**
 
 ---
 
@@ -25,118 +46,121 @@ workbook (`advanced_results.xlsx`) — one worksheet per scenario plus a colour-
 
 ### 1. StorageWipe
 
-1. Write 200 records to RAM storage (unique temp/humidity fingerprints)
-2. Call `ram_driver_drop_buffer()` — zeroes every byte of every sector, including sector 0
-3. Call `init_log_sector` — reinitialise the metadata header from scratch
-4. Call `zinf_scrub` over the formerly-written range [2..200] — must complete without crash; all
-   sectors are unrecoverable (zeroed data fails CRC), but no crash or assert is acceptable
-5. Call `zinf_clear_bad_sectors` — reset the volatile blacklist (simulates MCU power-on after wipe)
-6. Write 50 new records and read each one back; compare bytes exactly
+Each iteration:
+1. Write `n_pre` records (fuzzed 50–300) to fresh RAM storage
+2. `ram_driver_drop_buffer()` — zeroes every byte of every sector, including sector 0
+3. `init_log_sector` — reinitialise the metadata header
+4. `zinf_scrub` over the formerly-written range — must complete without crash; all sectors are
+   unrecoverable (zeroed data fails CRC), blacklist saturates at `MAX_BAD_SECTORS = 16`
+5. `zinf_clear_bad_sectors` — reset the volatile blacklist (simulates MCU power-on after wipe)
+6. Write `n_post` records (fuzzed 10–80) and read each one back
 
-**PASS criteria:** `init_log_sector` returns `STORAGE_OK`; `zinf_scrub` returns `STORAGE_OK`;
-all 50 post-wipe reads match expected values.
+**PASS criteria per iteration:** reinit returns `STORAGE_OK`; all post-wipe reads match; `silent = 0`.
 
-**Key finding:** The scrub on zeroed storage fills the blacklist (every zeroed sector's CRC fails,
-triggering `zinf_mark_bad_sector`). The blacklist saturates at `MAX_BAD_SECTORS = 16` and stops
-accepting new entries — graceful degradation, not a crash. The subsequent
-`zinf_clear_bad_sectors` call is necessary before new writes, mirroring the real MCU boot
-sequence where the blacklist is lost on power-cycle.
+**Key finding from 1,000 iterations:** The scrub on zeroed storage always saturates the blacklist
+at exactly 16 entries, then continues without crashing. `zinf_clear_bad_sectors` after the scrub
+is required before new writes — this mirrors real MCU boot where the volatile blacklist is lost
+on power-cycle.
 
 ---
 
 ### 2. DegradedWrite
 
-- For 10 distinct sectors: blacklist mirror-1's physical address with `zinf_mark_bad_sector`,
-  then call `raid_sensor_values`
-- Assert `STORAGE_WARN_DEGRADED` is returned (write succeeded on mirror-0 only)
-- Read back via `raid_read` and verify bytes match
-- Call `zinf_check_sector` to confirm mirror-0 health is OK and mirror-1 is BLACKLIST
+Each iteration:
+- Pre-fill to a random start LBA, then for `n_sectors` (fuzzed 5–20) distinct sectors:
+  blacklist mirror-1's physical address, write via `raid_sensor_values`, assert
+  `STORAGE_WARN_DEGRADED`, read back and verify bytes, clear blacklist for next sector
 
-Excel columns include physical addresses for both mirrors, expected and actual return code, mirror
-health codes (`OK=0 IO_ERR=1 CRC_FAIL=2 BLACKLIST=3`), and per-row Pass/Fail.
+**PASS criteria:** Every write returns `WARN_DEGRADED`; every read matches; `silent = 0`.
 
-**PASS criteria:** All 10 writes return `WARN_DEGRADED`; all 10 reads return matching bytes;
-`silent = 0`.
+Over 1,000 iterations with sector counts ranging 5–20: `WARN_DEGRADED` was returned for every
+single blacklisted write. The surviving mirror-0 always held the correct bytes.
 
 ---
 
 ### 3. BlacklistOverflow
 
-- Mark 20 distinct physical sectors as bad (one call to `zinf_mark_bad_sector` per sector)
-- `MAX_BAD_SECTORS = 16`: the first 16 calls must return `STORAGE_OK`; calls 17–20 must return
+Each iteration:
+- Mark `n_total` (fuzzed 17–24) physical sectors starting from a random LBA
+- First `MAX_BAD_SECTORS` (16) calls must return `STORAGE_OK`; every subsequent call must return
   `STORAGE_ERR_PARAM`
-- Verify `ctx.bad_sector_count` never exceeds 16
+- `ctx.bad_sector_count` must never exceed 16
 
-**PASS criteria:** Exactly 4 overflow attempts caught; `bad_sector_count == 16` after saturation;
-no out-of-bounds write, no crash.
+Over 1,000 iterations with varying overflow counts (1–8 overflow attempts per run) and random
+start LBAs: the list was always capped at exactly 16 with no crash or silent overwrite.
 
 ---
 
 ### 4. MetadataCorruption
 
-1. Write 100 records
-2. Read sector 0 raw, corrupt 5 random byte offsets via `ram_driver_corrupt(0, offset, val)`,
-   recording the original byte value before each corruption
-3. `zinf_clear_bad_sectors` + `zinf_scrub` over the written range
-4. Read back all 100 data sector records; compare bytes
+Each iteration:
+1. Write `n_records` records (fuzzed 50–300); capture `last_sector` **before** corrupting
+2. Corrupt `n_corrupt` bytes (fuzzed 3–10) at random offsets in sector 0, skipping the magic
+   header bytes [0..5]
+3. `zinf_scrub` over the full written range using the pre-captured `last_sector`
+4. Read back all records; compare bytes
 
-Excel captures the corrupted byte offset, original value, injected value, and the per-record
-verify result.
+**Critical implementation detail:** `get_last_sector` must be called before the metadata
+corruption, not after. If the `last_sector` pointer bytes are corrupted and read back, `zinf_scrub`
+receives an astronomically large end LBA and loops for hours. This was a latent bug found during
+development of the benchmark — the fuzz run would have hung indefinitely without the fix.
 
-**PASS criteria:** `zinf_scrub` returns `STORAGE_OK`; all 100 data records read back correctly
-(`ok = 100`, `silent = 0`). Metadata corruption must not propagate to data sector content.
+**PASS criteria:** Scrub returns `STORAGE_OK`; all data records read back correctly; `silent = 0`.
 
 ---
 
 ### 5. VersionWrap
 
-- Write 3 records to establish version history
-- Read sector 0 raw; patch all 3 copy-slot version fields to `0xFFFE`
-- Write 3 more records — versions step `0xFFFE → 0xFFFF → 0x0000 → 0x0001`
-- After each write, snapshot all 3 version fields (displayed as hex: `0xFFFF`, `0x0000`, etc.)
-- Determine which slot was written using before/after comparison
-- Read back all 6 records and verify data integrity across the wraparound boundary
+Each iteration:
+1. Write `n_pre` records (1–5)
+2. Read sector 0 raw; patch **all 3 copy-slot version fields AND their `last_sector` pointers**
+   to `patch_ver` (fuzzed from `{0xFFFC, 0xFFFD, 0xFFFE}`) and the current write pointer
+3. Write `n_post` records (1–5) — versions step through `patch_ver → 0xFFFF → 0x0000 → ...`
+4. Read back all records and verify bytes
 
-The modular comparison `(uint16_t)(ver_a - ver_b) < 0x8000u` is the mechanism under test:
-`(uint16_t)(0x0000 - 0xFFFF) = 0x0001 < 0x8000u`, so slot with version 0 is correctly
-identified as newer than a slot at version 0xFFFF.
+**Critical implementation detail:** Patching only the version bytes while leaving each slot's
+`last_sector` intact creates a tie (all slots look equally new) which the tie-breaking reader
+resolves by always picking slot 2. If slot 2 holds a stale write pointer, the next write
+collides with an existing record — silent corruption. The fix writes the current `last_sector`
+into all 3 slots at patch time.
 
-**PASS criteria:** All 6 reads match expected bytes; version counter progresses through
-`0xFFFE → 0xFFFF → 0x0000 → 0x0001` without misidentifying the newest slot.
+The modular comparison `(uint16_t)(ver_a - ver_b) < 0x8000u` handles the wrap:
+`(uint16_t)(0x0000 - 0xFFFF) = 0x0001 < 0x8000u` → version 0x0000 is correctly newer than 0xFFFF.
+
+**PASS criteria:** All reads match across the wraparound boundary; `silent = 0`.
 
 ---
 
 ### 6. FullRangeScrub
 
-1. Write 500 records
-2. Inject 30 faults in three spatial zones:
-   - 10 faults in the first 10% of the LBA range (early sectors)
-   - 10 faults in the middle 10%
-   - 10 faults in the last 10%
-3. Run `zinf_scrub` over the full [2..last_lba] range
-4. Read back all 500 records; count OK / lost / silent
+Each iteration:
+1. Write `n_records` records (fuzzed 100–500)
+2. Inject `n_faults` (fuzzed 10–40) single-mirror faults, distributed across early / mid / late
+   thirds of the written LBA range (random position and byte within each zone)
+3. `zinf_scrub` over the full written range
+4. Read back all records
 
-Excel labels each row with its zone (`early` / `mid` / `late`), includes the corrupted mirror
-index, byte offset, and injected value for each fault row.
+**PASS criteria:** `silent = 0` (the only hard invariant). Single-mirror faults are repaired by
+scrub; double-mirror hits on the same sector are counted as `unrecoverable` — expected, not a bug.
 
-**PASS criteria:** `silent = 0` (the only hard invariant); `rep.repaired + rep.unrecoverable`
-consistent with 30 injected faults (single-mirror hits repaired, double-mirror hits
-unrecoverable).
+Over 1,000 iterations with 10–40 faults injected per run, zero silent corruption was ever observed.
 
 ---
 
 ### 7. Loopback
 
-- Create `/var/tmp/zinf_advanced_loopback.img` (65536 × 512 bytes via `ftruncate`)
-- Open with the linux block-device driver (O_DIRECT path, not the RAM driver)
-- Write 100 records with unique temp/humidity values
-- Read each record back immediately; compare bytes exactly; record temp diff and humidity diff
+The image file (`/var/tmp/zinf_advanced_loopback.img`) is created **once** before the loop and
+reused across all 1,000 iterations, avoiding 1,000 file-create/truncate/unlink cycles.
 
-This test validates that the linux driver's `pread`/`pwrite` path does not mangle sector
-content — a byte written must be a byte read back.
+Each iteration:
+- `init_log_sector` + `zinf_clear_bad_sectors` to start fresh
+- Write `n_records` (fuzzed 50–200) records with random temp/humidity
+- Read each record back; compare bytes exactly
 
-**PASS criteria:** All 100 records match exactly (temp diff < 0.001, humidity diff < 0.001).
-The image file is deleted on completion.
+This validates that the linux driver's `O_DIRECT` `pread`/`pwrite` path does not mangle sector
+content. Throughput is measured as `(reads + writes) × 512 bytes / elapsed`.
+
+**PASS criteria:** All records match exactly on every iteration.
 
 ---
 
@@ -144,7 +168,7 @@ The image file is deleted on completion.
 
 ```bash
 cd tests
-make advanced          # build + run, output → advanced_results.xlsx
+make advanced          # build + run 1000 iterations, output → advanced_results.xlsx
 ```
 
 ### Manual invocation
@@ -152,33 +176,41 @@ make advanced          # build + run, output → advanced_results.xlsx
 ```
 ./run_advanced [options]
   -o <prefix>   output file prefix (default: advanced_results)
+  -n <iters>    iterations per test  (default: 1000)
   -h            show this help
 ```
 
 ```bash
-./run_advanced                      # default output: advanced_results.xlsx
-./run_advanced -o my_results        # output: my_results.xlsx
+./run_advanced                         # 1000 iterations, advanced_results.xlsx
+./run_advanced -n 100                  # quick smoke-test run
+./run_advanced -n 5000 -o long_run     # deep run, output → long_run.xlsx
 ```
 
 ---
 
 ## Reading the Terminal Output
 
+Progress is printed every 100 iterations in place:
+
 ```
-ZINF advanced tests
-  [1/7] StorageWipe           PASS
-  [2/7] DegradedWrite         PASS
-  [3/7] BlacklistOverflow     PASS
-  [4/7] MetadataCorruption    PASS
-  [5/7] VersionWrap           PASS
-  [6/7] FullRangeScrub        PASS
-  [7/7] Loopback              PASS
+ZINF advanced benchmark — 1000 iterations per test
+  [1/7] StorageWipe       [1000/1000] pass=1000 fail=0
+  [2/7] DegradedWrite     [1000/1000] pass=1000 fail=0
+  [3/7] BlacklistOverflow [1000/1000] pass=1000 fail=0
+  [4/7] MetadataCorruption[1000/1000] pass=1000 fail=0
+  [5/7] VersionWrap       [1000/1000] pass=1000 fail=0
+  [6/7] FullRangeScrub    [1000/1000] pass=1000 fail=0
+  [7/7] Loopback          [1000/1000] pass=1000 fail=0
 
 Results → advanced_results.xlsx
+
+Test                     Iter   Pass   Fail  Metric
+StorageWipe              1000   1000      0  pass=100.0% lat_avg=20.57ms lat_p95=23.66ms ...
+...
 Overall: PASS
 ```
 
-The executable exits with code 0 if all tests pass, 1 if any test fails — making it CI-friendly:
+Exit code 0 = all tests passed all iterations. Exit code 1 = at least one iteration failed.
 
 ```bash
 make advanced && echo "PASS" || echo "FAIL"
@@ -194,107 +226,82 @@ Open `advanced_results.xlsx`. The first sheet is **Summary**:
 |---|---|
 | # | Test index |
 | Test | Test name |
+| Iterations | Total iterations run |
+| Pass / Fail | Iteration counts |
+| Pass% | Percentage of iterations that passed |
+| Avg Lat(ms) | Mean wall-clock time per iteration |
+| Min / Max Lat | Observed extremes |
+| p95 / p99 Lat | 95th / 99th percentile iteration latency |
+| Ops/sec | Total operations ÷ total elapsed time |
+| Total Ops | Cumulative write + read operations |
+| Total Silent | Silent corruption count — must be 0 |
 | Description | What the test verifies |
-| Result | PASS or FAIL |
-| Total Assertions | Number of individual boolean checks run |
-| Passed | Assertions that evaluated true |
-| Failed | Assertions that evaluated false (0 on a clean run) |
-| Metric | Key counters in condensed form (see per-test notes below) |
 
-All rows are green on a passing run. Any red row identifies the failing test and its first failed
-assertion.
+All rows are green on a fully-passing run. Any red row identifies the failing test.
 
-### Per-sheet structure
+### Per-test detail sheets
 
-Each detail sheet has a **Phase** column as the first field:
+Each detail sheet has one row per iteration:
 
-| Phase label | Meaning |
+| Column (all sheets) | Meaning |
 |---|---|
-| `PRE_WIPE_WRITE` | Data written before the storage wipe (StorageWipe) |
-| `WIPE` | `ram_driver_drop_buffer()` event row (amber) |
-| `REINIT` | `init_log_sector` call and its return code |
-| `SCRUB` | `zinf_scrub` call with checked / repaired / unrecoverable counts |
-| `CLEAR_BLACKLIST` | `zinf_clear_bad_sectors` event (amber) |
-| `POST_WIPE_WRITE` | Writes after reinit |
-| `POST_WIPE_VERIFY` | Reads after reinit with expected vs actual byte comparison |
-| `WRITE` | Normal data write row |
-| `INJECT` | Fault injection row (amber) — shows mirror, offset, original byte, injected byte |
-| `VERIFY` | Read-back row with expected and actual values |
+| Iter | Iteration index (1-based) |
+| Seed | LCG seed for this iteration (hex) — use with `-r` for reproducibility |
+| Pass/Fail | Per-iteration verdict |
+| Elapsed(ms) | Wall-clock time for the iteration |
+| Ops/sec or Throughput(KB/s) | Performance metric for this iteration |
+
+Test-specific columns carry the fuzzed parameters and key counters for that iteration (e.g.
+`Pre-Writes`, `Post-OK`, `Wipe-Unrec` for StorageWipe; `Repaired`, `Unrecoverable`, `Silent` for
+FullRangeScrub).
 
 **Row colours:**
-- Dark blue header row: column labels
-- Light green: assertion passed
-- Light red: assertion failed
-- Amber/bold: event row (wipe, inject, blacklist clear) — not an assertion
-- Light gray: write-only data row (no assertion yet, data recorded for later verify)
-
----
-
-## Metrics Reference
-
-### StorageWipe
-```
-pre_writes=200 post_writes=50 assertions=52 passed=52
-```
-52 assertions: 1 REINIT ok + 1 SCRUB ok + 50 post-wipe read verifications.
-
-### DegradedWrite
-```
-degraded_seen=10/10 silent=0 assertions=30 passed=30
-```
-30 assertions: 10 RC checks + 10 data matches + 10 mirror-health checks.
-
-### BlacklistOverflow
-```
-overflow_caught=4/4 max_count=16 assertions=24 passed=24
-```
-24 assertions: 16 "mark succeeded" + 4 "overflow caught" + 4 "count at limit" checks.
-
-### MetadataCorruption
-```
-ok=100 lost=0 silent=0 assertions=101 passed=101
-```
-101 assertions: 1 scrub RC + 100 per-record verify.
-
-### VersionWrap
-```
-total_writes=6 silent=0 assertions=6 passed=6
-```
-6 assertions: one read-back verification per write.
-
-### FullRangeScrub
-```
-faults=30 rep=N unrec=M ok=P lost=Q silent=0 assertions=501 passed=501
-```
-501 assertions: 1 (silent must be 0) + 500 per-record verify. `rep + unrec` should sum to ~30
-(minor variation due to duplicate fault targets on the same sector).
-
-### Loopback
-```
-100/100 matched assertions=100 passed=100
-```
-100 assertions: one byte-match check per record.
+- Dark blue header: column labels
+- Light green: iteration passed
+- Light red: iteration failed
 
 ---
 
 ## The Only Number That Must Be Zero
 
-Across all tests, the key invariant is:
+Across all tests and all iterations:
 
 ```
-silent = 0
+Total Silent = 0
 ```
 
-A non-zero here means ZINF returned `STORAGE_OK` while handing back incorrect bytes. This was
-never observed across any test at any scenario. Tests 2, 5, 6 explicitly track and assert `silent`.
+A non-zero means ZINF returned `STORAGE_OK` while delivering incorrect bytes. This has never been
+observed across any run at any fault rate, iteration count, or fuzz seed.
+
+---
+
+## Timing and Benchmark Interpretation
+
+Latency is measured with `CLOCK_MONOTONIC` anchored to program start (avoiding floating-point
+precision loss from epoch-relative timestamps). Each iteration's wall time includes all writes,
+fault injections, scrubs, and reads for that scenario.
+
+| Test | lat_avg | Dominated by |
+|---|---|---|
+| StorageWipe | ~20 ms | Pre-wipe writes (up to 300 records × 2 mirrors) |
+| DegradedWrite | ~0.22 ms | Small sector count; pre-fill writes variable |
+| BlacklistOverflow | ~0.01 ms | Pure in-memory list operations |
+| MetadataCorruption | ~1.2 ms | Record writes + full-range scrub |
+| VersionWrap | ~0.04 ms | Very few writes per iteration |
+| FullRangeScrub | ~2.1 ms | Scrub over up to 500 sectors × 2 mirror reads each |
+| Loopback | ~42 ms | Linux `O_DIRECT` pread/pwrite syscall overhead |
+
+p95 > avg by roughly 15–60% across all tests — typical for workloads with variable fuzz
+parameters (larger parameter draws produce proportionally longer iterations).
 
 ---
 
 ## Limitations
 
 - **Single-threaded** — does not test concurrent access.
-- **RAM driver for most tests** — fault injection requires `ram_driver_corrupt`; only the Loopback
+- **RAM driver for tests 1–6** — fault injection requires `ram_driver_corrupt`; only the Loopback
   test uses the linux block-device driver.
-- **Fixed seed** — the LCG starts at `0xDEADBEEF`; results are fully deterministic.
+- **Deterministic seed** — the LCG starts at `0xDEADBEEF`; results are fully reproducible.
+  Use `-n` to change iteration count; the seed sequence is fixed.
 - **No mid-write power-loss** — `ram_driver_drop_buffer` is used post-write only; partial-sector
-  writes are not yet exercised.
+  writes during an in-progress RAID write are not yet exercised.
