@@ -1,0 +1,24 @@
+[package]
+name = "zinf-studio"
+version = "0.1.0"
+description = "ZINF Studio — desktop GUI for ZINF data loggers"
+authors = ["Aranykacsa"]
+edition = "2021"
+
+[lib]
+name = "zinf_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+libc = "0.2"
+tera = "1"

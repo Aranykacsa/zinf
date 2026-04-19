@@ -1,6 +1,6 @@
 # Advanced Test Suite — Running and Interpreting Results
 
-The advanced test (`tests/test_advanced.c`) is a benchmark-grade regression suite covering eight
+The advanced test (`tests/test_advanced.c`) is a benchmark-grade regression suite covering eleven
 edge-case scenarios that the fuzzer and realistic lifecycle test do not exercise. Each test runs
 **1,000 iterations** with randomised (fuzzed) parameters, measures wall-clock latency via
 `CLOCK_MONOTONIC`, and writes one row per iteration to an Excel workbook
@@ -16,12 +16,15 @@ The RepairCycle test writes 10 rows per iteration (one per round), for a total o
 |---|---|---|---|
 | 1 | StorageWipe | Full RAM wipe + reinit — storage usable after total loss of content | pre-writes ∈ [50,300], post-writes ∈ [10,80] |
 | 2 | DegradedWrite | Write with mirror-1 pre-blacklisted — exercises `STORAGE_WARN_DEGRADED` | sectors-tested ∈ [5,20], random start LBA |
-| 3 | BlacklistOverflow | Mark more than `MAX_BAD_SECTORS` (16) — proves graceful saturation | total-attempts ∈ [17,24], random start LBA |
+| 3 | BlacklistOverflow | Mark more than `MAX_BAD_SECTORS` (64) — proves graceful saturation | total-attempts ∈ [65,96], random start LBA |
 | 4 | MetadataCorruption | Corrupt sector 0 — data sectors must be unaffected | records ∈ [50,300], corruptions ∈ [3,10] |
 | 5 | VersionWrap | Version counter 0xFFFC–0xFFFE → 0x0000 — proves modular comparison | patch-ver ∈ {0xFFFC, 0xFFFD, 0xFFFE} |
 | 6 | FullRangeScrub | Scattered faults across early/mid/late zones, full-range scrub | records ∈ [100,500], faults ∈ [10,40] |
 | 7 | Loopback | Linux block-device driver end-to-end byte integrity | records ∈ [50,200], image reused |
 | 8 | RepairCycle | 10 rounds of random corruption → scrub → verify on the same dataset — proves no silent corruption as damage accumulates | records ∈ [100,400], fault_rate ∈ [1%,5%] |
+| 9 | MsgLogInterleave | Interleaved `raid_sensor_values` + `save_msg` — message overflow to sector 1 must not corrupt any data record | records ∈ [10,50], msgs ∈ [200,600] |
+| 10 | DiskFull | Write to capacity — `STORAGE_ERR_FULL` fires at exactly `mirror_offset` writes; 5 post-error writes all rejected; pre-fill records intact | pre-fill ∈ [10,50], 1024-sector image |
+| 11 | DoubleFault | Sub-A: recover → new fault → scrub → still readable. Sub-B: double-corrupt both mirrors → scrub → `STORAGE_ERR_UNRECOVERABLE`, no silent corruption on any other record | records ∈ [20,100], sector_x random |
 
 ---
 
@@ -31,17 +34,20 @@ Results from a 1,000-iteration run:
 
 ```
 Test                     Iter   Pass   Fail  Metric
-StorageWipe              1000   1000      0  pass=100.0% lat_avg=19.51ms lat_p95=20.63ms ops/sec=13607  silent=0
-DegradedWrite            1000   1000      0  pass=100.0% lat_avg=0.23ms  lat_p95=0.39ms  ops/sec=556026 silent=0
-BlacklistOverflow        1000   1000      0  pass=100.0% lat_avg=0.01ms  lat_p95=0.02ms  ops/sec=2.2M
-MetadataCorruption       1000   1000      0  pass=100.0% lat_avg=1.16ms  lat_p95=1.89ms  ops/sec=305655 silent=0
+StorageWipe              1000   1000      0  pass=100.0% lat_avg=19.51ms lat_p95=20.70ms ops/sec=13609  silent=0
+DegradedWrite            1000   1000      0  pass=100.0% lat_avg=0.22ms  lat_p95=0.37ms  ops/sec=578901 silent=0
+BlacklistOverflow        1000   1000      0  pass=100.0% lat_avg=0.01ms  lat_p95=0.01ms  ops/sec=9.2M
+MetadataCorruption       1000   1000      0  pass=100.0% lat_avg=1.16ms  lat_p95=1.88ms  ops/sec=305800 silent=0
 VersionWrap              1000   1000      0  pass=100.0% lat_avg=0.04ms  lat_p95=0.05ms  silent=0
-FullRangeScrub           1000   1000      0  pass=100.0% lat_avg=2.04ms  lat_p95=3.23ms  ops/sec=293203 silent=0
-Loopback                 1000   1000      0  pass=100.0% lat_avg=39.47ms lat_p95=62.70ms throughput=3177 KB/s
-RepairCycle              1000   1000      0  pass=100.0% lat_avg=12.33ms lat_p95=19.06ms ops/sec=223040 silent=0
+FullRangeScrub           1000   1000      0  pass=100.0% lat_avg=2.02ms  lat_p95=3.21ms  ops/sec=296243 silent=0
+Loopback                 1000   1000      0  pass=100.0% lat_avg=40.58ms lat_p95=65.14ms throughput=3090 KB/s
+RepairCycle              1000   1000      0  pass=100.0% lat_avg=12.46ms lat_p95=19.18ms ops/sec=220748 silent=0
+MsgLogInterleave         1000   1000      0  pass=100.0% lat_avg=0.16ms  lat_p95=0.24ms  ops/sec=376542 silent=0
+DiskFull                 1000   1000      0  pass=100.0% lat_avg=0.72ms  lat_p95=0.78ms  ops/sec=755101 silent=0
+DoubleFault              1000   1000      0  pass=100.0% lat_avg=0.39ms  lat_p95=0.60ms  ops/sec=465711 silent=0
 ```
 
-**Silent corruption across all 8,000 iterations (80,000 round-level verifications): 0.**
+**Silent corruption across all 11,000 iterations (80,000 RepairCycle round-level verifications): 0.**
 
 ---
 
@@ -196,6 +202,75 @@ handful of sectors, but silent corruption remains zero.
 
 ---
 
+### 9. MsgLogInterleave
+
+Each iteration:
+1. Interleave `save_msg` and `raid_sensor_values` calls — messages are drained proportionally
+   before each sensor write so the two code paths are exercised together
+2. When `n_msgs > 471` (MSG_LOG_CAP_S0), the message log overflows into `log_sector + 1`
+   (sector 1) — the same sector that was formerly overwritten by data writes before the
+   `log_init_log_sector` seed fix
+3. After all writes, read back all sensor records and verify bytes match exactly
+4. Raw-read sectors 0 and 1; verify all message bytes at their expected offsets
+
+**PASS criteria:** All sensor records match; all message bytes match; `silent = 0`.
+
+**Key finding:** After fixing `log_init_log_sector` to seed copy slots at `metadata_sectors - 1`
+(so data starts at LBA 2, not LBA 1), overflow messages writing to sector 1 no longer conflict
+with data writes. This test confirms the fix is sufficient and there is no interaction between
+the two code paths under any fuzz combination.
+
+---
+
+### 10. DiskFull
+
+Uses a compact 1024-sector image (capacity = 511 single-sector writes) to keep each iteration
+fast while still exercising the full boundary path.
+
+Each iteration:
+1. Write `n_prefill` (fuzzed 10–50) records; shadow their LBAs and values
+2. Write in a loop until `STORAGE_ERR_FULL` is returned; count successful writes
+3. Verify `n_prefill + fills_until_full == mirror_offset` (exactly 511 total writes)
+4. Verify `get_last_sector` returns a value below `metadata_sectors + mirror_offset` (no overflow)
+5. Attempt 5 more writes after the error; all must return `STORAGE_ERR_FULL`
+6. Read back the pre-fill records; verify bytes match exactly
+
+**PASS criteria:** FULL fires at exactly capacity; no write accepted after FULL; pre-fill
+records intact; `silent = 0`.
+
+---
+
+### 11. DoubleFault
+
+Two sub-scenarios per iteration, each with a fresh RAM context seeded identically:
+
+**Sub-scenario A** (recover → new fault → scrub → readable):
+1. Write `n_records`; pick `sector_x` randomly
+2. Corrupt mirror 0's CRC field (→ all zeros, guaranteed CRC failure)
+3. `zinf_recover_sector(sector_x)` → repairs mirror 0 from mirror 1 → `STORAGE_OK`
+4. Corrupt mirror 1's CRC field (→ all ones, guaranteed CRC failure)
+5. `zinf_scrub(sector_x, sector_x)` → repairs mirror 1 from the freshly-repaired mirror 0
+6. `raid_read(sector_x)` → must return `STORAGE_OK` with correct bytes
+
+**Sub-scenario B** (double corruption → scrub → unrecoverable, no silent):
+1. Same initial write batch as sub-A
+2. Corrupt mirror 0's CRC → zeros
+3. `zinf_recover_sector(sector_x)` → mirror 0 repaired
+4. Corrupt mirror 0's CRC again → all ones (mirror 0 bad again)
+5. Corrupt mirror 1's CRC → zeros (mirror 1 bad too)
+6. `zinf_scrub(sector_x, sector_x)` → both bad → blacklists both LBAs
+7. `raid_read(sector_x)` → must return `STORAGE_ERR_UNRECOVERABLE` (not silent OK)
+8. Read all other records → must all return `STORAGE_OK` with correct bytes
+
+**Key design decision:** CRC bytes are corrupted directly (not arbitrary payload bytes)
+to guarantee CRC failure regardless of payload content. Corrupting an arbitrary byte risks a
+1/256 chance of the corruption matching the original value, making the test non-deterministic.
+
+**PASS criteria:** Sub-A readable; sub-B returns `STORAGE_ERR_UNRECOVERABLE` for `sector_x`;
+all other records intact; `silent = 0`.
+
+---
+
 ## Running the Tests
 
 ```bash
@@ -226,14 +301,17 @@ Progress is printed every 100 iterations in place:
 
 ```
 ZINF advanced benchmark — 1000 iterations per test
-  [1/8] StorageWipe       [1000/1000] pass=1000 fail=0
-  [2/8] DegradedWrite     [1000/1000] pass=1000 fail=0
-  [3/8] BlacklistOverflow [1000/1000] pass=1000 fail=0
-  [4/8] MetadataCorruption[1000/1000] pass=1000 fail=0
-  [5/8] VersionWrap       [1000/1000] pass=1000 fail=0
-  [6/8] FullRangeScrub    [1000/1000] pass=1000 fail=0
-  [7/8] Loopback          [1000/1000] pass=1000 fail=0
-  [8/8] RepairCycle       [1000/1000] pass=1000 fail=0
+  [1/11]  StorageWipe        [1000/1000] pass=1000 fail=0
+  [2/11]  DegradedWrite      [1000/1000] pass=1000 fail=0
+  [3/11]  BlacklistOverflow  [1000/1000] pass=1000 fail=0
+  [4/11]  MetadataCorruption [1000/1000] pass=1000 fail=0
+  [5/11]  VersionWrap        [1000/1000] pass=1000 fail=0
+  [6/11]  FullRangeScrub     [1000/1000] pass=1000 fail=0
+  [7/11]  Loopback           [1000/1000] pass=1000 fail=0
+  [8/11]  RepairCycle        [1000/1000] pass=1000 fail=0
+  [9/11]  MsgLogInterleave   [1000/1000] pass=1000 fail=0
+  [10/11] DiskFull           [1000/1000] pass=1000 fail=0
+  [11/11] DoubleFault        [1000/1000] pass=1000 fail=0
 
 Results → advanced_results.xlsx
 
@@ -325,6 +403,9 @@ fault injections, scrubs, and reads for that scenario.
 | FullRangeScrub | ~2.0 ms | Scrub over up to 500 sectors × 2 mirror reads each |
 | Loopback | ~39 ms | Linux `O_DIRECT` pread/pwrite syscall overhead |
 | RepairCycle | ~12 ms | 10 scrubs × up to 400 sectors + 10 × up to 400 reads |
+| MsgLogInterleave | ~0.16 ms | Up to 50 sensor writes + up to 600 msg saves |
+| DiskFull | ~0.72 ms | 511 writes to fill 1024-sector image + 5 post-error attempts |
+| DoubleFault | ~0.39 ms | 2 × n_records writes + recovery + scrub + readback |
 
 p95 > avg by roughly 15–60% across all tests — typical for workloads with variable fuzz
 parameters (larger parameter draws produce proportionally longer iterations).

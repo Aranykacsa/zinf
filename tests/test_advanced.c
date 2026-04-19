@@ -1915,15 +1915,24 @@ static dft_iter_t run_double_fault(uint32_t seed, int n_records, int sector_x) {
         uint64_t m0_phys = lba_x;
         uint64_t m1_phys = lba_x + (uint64_t)ADV_MIRROR_OFF;
 
-        /* Step 1: corrupt mirror 0 */
-        ram_driver_corrupt(m0_phys, 2u, 0xDEu);
+        /* Corrupt CRC field (last 4 bytes) — guarantees CRC failure regardless
+           of payload content, unlike corrupting arbitrary payload bytes which
+           may coincidentally match the original value. */
+        /* Step 1: corrupt mirror 0 CRC → zeros */
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 4u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 3u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 2u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 1u, 0x00u);
 
         /* Step 2: recover sector — repairs mirror 0 from mirror 1 */
         uint8_t rec = zinf_recover_sector(&ctx, lba_x);
         if (rec != STORAGE_OK) { r.scen_a_pass = 0; r.pass = 0; goto done_a; }
 
-        /* Step 3: new fault on mirror 1 (simulates power-loss after repair) */
-        ram_driver_corrupt(m1_phys, 2u, 0xBEu);
+        /* Step 3: new fault on mirror 1 CRC → all-ones (simulates power-loss after repair) */
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 4u, 0xFFu);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 3u, 0xFFu);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 2u, 0xFFu);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 1u, 0xFFu);
 
         /* Step 4: scrub single sector — should repair mirror 1 from mirror 0 */
         zinf_clear_bad_sectors(&ctx);
@@ -1964,17 +1973,26 @@ done_a:
         uint64_t m0_phys  = lba_x;
         uint64_t m1_phys  = lba_x + (uint64_t)ADV_MIRROR_OFF;
 
-        /* Step 1: corrupt mirror 0 (pattern A) */
-        ram_driver_corrupt(m0_phys, 2u, 0xDEu);
+        /* Step 1: corrupt mirror 0 CRC → zeros */
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 4u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 3u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 2u, 0x00u);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 1u, 0x00u);
 
-        /* Step 2: recover — mirrors mirror 1 into mirror 0 */
+        /* Step 2: recover — repairs mirror 0 from mirror 1 */
         zinf_recover_sector(&ctx, lba_x);
 
-        /* Step 3: corrupt mirror 0 again (pattern B — different value) */
-        ram_driver_corrupt(m0_phys, 3u, 0xADu);
+        /* Step 3: corrupt mirror 0 CRC again → all-ones (mirror 0 bad again) */
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 4u, 0xFFu);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 3u, 0xFFu);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 2u, 0xFFu);
+        ram_driver_corrupt(m0_phys, SECTOR_SIZE - 1u, 0xFFu);
 
-        /* Step 4: corrupt mirror 1 (pattern C) */
-        ram_driver_corrupt(m1_phys, 4u, 0xBEu);
+        /* Step 4: corrupt mirror 1 CRC → zeros (mirror 1 bad too) */
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 4u, 0x00u);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 3u, 0x00u);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 2u, 0x00u);
+        ram_driver_corrupt(m1_phys, SECTOR_SIZE - 1u, 0x00u);
 
         /* Step 5: scrub — both mirrors bad → unrecoverable, LBAs blacklisted */
         zinf_clear_bad_sectors(&ctx);
@@ -2172,29 +2190,35 @@ int main(int argc, char *argv[]) {
     lxw_workbook  *wb     = workbook_new(xl_path);
     xl_fmts_t      fmts   = make_formats(wb);
 
-    lxw_worksheet *ws_sum    = workbook_add_worksheet(wb, "Summary");
-    lxw_worksheet *ws_wipe   = workbook_add_worksheet(wb, "StorageWipe");
-    lxw_worksheet *ws_deg    = workbook_add_worksheet(wb, "DegradedWrite");
-    lxw_worksheet *ws_blk    = workbook_add_worksheet(wb, "BlacklistOverflow");
-    lxw_worksheet *ws_meta   = workbook_add_worksheet(wb, "MetadataCorruption");
-    lxw_worksheet *ws_ver    = workbook_add_worksheet(wb, "VersionWrap");
-    lxw_worksheet *ws_scrub  = workbook_add_worksheet(wb, "FullRangeScrub");
-    lxw_worksheet *ws_loop   = workbook_add_worksheet(wb, "Loopback");
-    lxw_worksheet *ws_repair = workbook_add_worksheet(wb, "RepairCycle");
+    lxw_worksheet *ws_sum     = workbook_add_worksheet(wb, "Summary");
+    lxw_worksheet *ws_wipe    = workbook_add_worksheet(wb, "StorageWipe");
+    lxw_worksheet *ws_deg     = workbook_add_worksheet(wb, "DegradedWrite");
+    lxw_worksheet *ws_blk     = workbook_add_worksheet(wb, "BlacklistOverflow");
+    lxw_worksheet *ws_meta    = workbook_add_worksheet(wb, "MetadataCorruption");
+    lxw_worksheet *ws_ver     = workbook_add_worksheet(wb, "VersionWrap");
+    lxw_worksheet *ws_scrub   = workbook_add_worksheet(wb, "FullRangeScrub");
+    lxw_worksheet *ws_loop    = workbook_add_worksheet(wb, "Loopback");
+    lxw_worksheet *ws_repair  = workbook_add_worksheet(wb, "RepairCycle");
+    lxw_worksheet *ws_mli     = workbook_add_worksheet(wb, "MsgLogInterleave");
+    lxw_worksheet *ws_df      = workbook_add_worksheet(wb, "DiskFull");
+    lxw_worksheet *ws_dft     = workbook_add_worksheet(wb, "DoubleFault");
 
     printf("ZINF advanced benchmark — %d iterations per test\n", n_iters);
 
-    result_t results[8];
-    results[0] = bench_storage_wipe       (ws_wipe,   &fmts, n_iters);
-    results[1] = bench_degraded_write     (ws_deg,    &fmts, n_iters);
-    results[2] = bench_blacklist_overflow (ws_blk,    &fmts, n_iters);
-    results[3] = bench_metadata_corruption(ws_meta,   &fmts, n_iters);
-    results[4] = bench_version_wrap       (ws_ver,    &fmts, n_iters);
-    results[5] = bench_full_range_scrub   (ws_scrub,  &fmts, n_iters);
-    results[6] = bench_loopback           (ws_loop,   &fmts, n_iters);
-    results[7] = bench_repair_cycle       (ws_repair, &fmts, n_iters);
+    result_t results[11];
+    results[0]  = bench_storage_wipe       (ws_wipe,   &fmts, n_iters);
+    results[1]  = bench_degraded_write     (ws_deg,    &fmts, n_iters);
+    results[2]  = bench_blacklist_overflow (ws_blk,    &fmts, n_iters);
+    results[3]  = bench_metadata_corruption(ws_meta,   &fmts, n_iters);
+    results[4]  = bench_version_wrap       (ws_ver,    &fmts, n_iters);
+    results[5]  = bench_full_range_scrub   (ws_scrub,  &fmts, n_iters);
+    results[6]  = bench_loopback           (ws_loop,   &fmts, n_iters);
+    results[7]  = bench_repair_cycle       (ws_repair, &fmts, n_iters);
+    results[8]  = bench_msg_log_interleave (ws_mli,    &fmts, n_iters);
+    results[9]  = bench_disk_full          (ws_df,     &fmts, n_iters);
+    results[10] = bench_double_fault       (ws_dft,    &fmts, n_iters);
 
-    write_summary(ws_sum, &fmts, results, 8);
+    write_summary(ws_sum, &fmts, results, 11);
     workbook_close(wb);
 
     printf("\nResults → %s\n\n", xl_path);
@@ -2204,7 +2228,7 @@ int main(int argc, char *argv[]) {
            "----", "----", "----", "----", "------");
 
     int any_fail = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 11; i++) {
         result_t *r = &results[i];
         printf("%-22s %6d %6d %6d  %s\n",
                r->name, r->n_iter, r->pass_n, r->fail_n, r->metric);

@@ -101,7 +101,7 @@ zinf:
   mirror_count:     2     # default number of RAID copies
   header_size:      1     # reserved bytes at start of each sector
   metadata_sectors: 2     # sectors reserved for log metadata
-  max_bad_sectors:  16    # bad-sector blacklist capacity (1–255, default 16)
+  max_bad_sectors:  64    # bad-sector blacklist capacity (1–255, default 64)
 
   data_types:
     - name: sensor_t
@@ -150,6 +150,7 @@ The LBA of the primary metadata sector. Changing this allows the metadata to liv
 #define STORAGE_ERR_LOG_FULL      3u
 #define STORAGE_ERR_UNRECOVERABLE 4u
 #define STORAGE_WARN_DEGRADED     5u  /* non-fatal: write succeeded with fewer mirrors */
+#define STORAGE_ERR_FULL          6u  /* write would exceed device or mirror boundary */
 ```
 
 ### Driver (`driver.h`)

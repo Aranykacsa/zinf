@@ -25,7 +25,7 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 | [Fault Testing](testing/fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
 | [Fuzz Analysis](testing/fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
 | [Realistic Lifecycle Test](testing/realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
-| [Advanced Test Suite](testing/advanced-test.md) | 8 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O, repair cycle |
+| [Advanced Test Suite](testing/advanced-test.md) | 11 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O, repair cycle, msg-log interleave, disk full, double fault |
 | [Embedded Porting Guide](embedded-porting.md) | SPI wiring, CMakeLists.txt, and first-boot init for RP2350/Pico |
 
 ## Repository Layout

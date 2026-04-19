@@ -18,6 +18,7 @@ All storage API functions take a `zinf_ctx_t *ctx` as their first argument. This
 | `STORAGE_ERR_LOG_FULL` | `3` | Message log capacity exhausted |
 | `STORAGE_ERR_UNRECOVERABLE` | `4` | All mirrors failed CRC; data cannot be recovered |
 | `STORAGE_WARN_DEGRADED` | `5` | **Non-fatal.** Write succeeded on ≥1 mirror but fewer than `mirror_count` (some mirrors were blacklisted). The write committed; caller may want to call `zinf_recover_sector()`. |
+| `STORAGE_ERR_FULL` | `6` | Write would exceed device capacity or cross the mirror boundary. No data was written. |
 
 ### Driver Return Codes (`driver.h`)
 
