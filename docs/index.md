@@ -6,15 +6,18 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 
 - **RAID-1 mirroring** — two on-disk copies of every write for single-failure tolerance
 - **CRC32 integrity** — each sector is checksummed before being written
+- **ZINF Studio (Desktop GUI)** — A high-readability "Retro Creamy" interface for configuration, data extraction, and offline preview.
 - **Pluggable driver interface** — swap out the storage backend per platform
+- **Guided SDK Generation** — Generate hardened C integration layers with compiler-level guards.
 - **Low-RAM fallback** — sector-by-sector writes when heap is constrained
-- **Benchmark tooling** — built-in throughput and latency measurement
+- **Massive-Scale Fuzzing** — Proven durability via 1,000,000+ randomized fault iterations.
 
 ## Documentation
 
 | Document | Description |
 |---|---|
 | [Getting Started](getting-started.md) | Build, install, format a device, and first run |
+| [ZINF Studio Guide](studio-usage.md) | **New:** Comprehensive guide to the Explorer, Configurator, and SDK tabs |
 | [Architecture](architecture.md) | Layer design, RAID layout, and data flows |
 | [API Reference](api-reference.md) | All public functions with signatures and return codes |
 | [Data Formats](data-formats.md) | Sector, metadata, and sensor wire layouts |

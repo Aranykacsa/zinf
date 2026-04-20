@@ -32,12 +32,15 @@ Both commands initialize ZINF metadata (magic header + RAID layout) in a single 
 
 ## Inspect a Device
 
+### Option A: Desktop GUI (Recommended)
+Open **ZINF Studio** and select the device in the sidebar. The **Explorer** tab provides a real-time summary of sector geometry, RAID offset, and usable capacity.
+
+### Option B: CLI
 ```bash
 zinf info /dev/sdb
 ```
 
 Output:
-
 ```
 Image          : /dev/sdb
 Sector size    : 512
@@ -52,7 +55,7 @@ RAID offset    : 3872255
 
 ## Detect ZINF Devices
 
-After `sudo make install`, inserting a ZINF-formatted SD card fires the udev rule automatically — no manual trigger needed.
+After `sudo make install`, inserting a ZINF-formatted SD card fires the udev rule automatically. **ZINF Studio** will automatically populate detected devices in the sidebar.
 
 ```bash
 # Read udev properties (works out of the box after install)
@@ -77,22 +80,26 @@ blkid /dev/sdb           # → TYPE="zinf"
 
 ---
 
-## Write Data
+## Write and Verify Data
 
+### 1. Write via CLI
 One-shot sensor write:
-
 ```bash
 sudo zinf -d /dev/sdb raid sensor 1 23.5 65.0
 ```
 
-Interactive shell:
+### 2. Verify via Studio
+Open **ZINF Studio**, select the device, and click **[ Extract Data ]** in the **Explorer** tab. The new record will appear instantly in the "Retro Creamy" table view.
 
+---
+
+## Interactive Shell
+For advanced CLI tasks:
 ```bash
 sudo zinf shell /dev/sdb
 > help
 > raid sensor 2 23.5 65.0 24.1 62.3
 > msg save 42
-> msg test
 > cfg show
 ```
 

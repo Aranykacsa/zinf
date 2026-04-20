@@ -34,10 +34,5 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "fs": {
-      "all": true,
-      "scope": ["/dev/**", "/sys/block/**", "$HOME/**"]
-    }
-  }
+  "plugins": {}
 }

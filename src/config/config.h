@@ -21,7 +21,7 @@
 
 /* Default mirror count (used as fallback; overridden at runtime via zinf_ctx) */
 #ifndef RAID_MIRRORS
-#define RAID_MIRRORS 2u
+#define RAID_MIRRORS 3u
 #endif
 
 /* Maximum supported mirror count — raid_read() candidates[] is sized for this */

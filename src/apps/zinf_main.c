@@ -25,11 +25,99 @@ static const char *g_device = "/dev/loop0";
 #define CSV_IMG_SECTS 4096u
 
 /* =========================================================
+   Utilities
+   ========================================================= */
+
+static inline uint32_t xs32(uint32_t *s) {
+    uint32_t x = *s;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    *s = x; return x;
+}
+static inline float noise_f(uint32_t *s, float amp) {
+    uint32_t r = xs32(s) & 0xFFFFu;
+    return (((float)r / 32767.5f) - 1.0f) * amp;
+}
+static inline float tri01(uint32_t phase, uint32_t period) {
+    if (!period) return 0.0f;
+    uint32_t p = phase % period, half = period / 2u;
+    if (!half) return 0.0f;
+    return (p < half) ? (float)p / (float)half
+                       : (float)(period - p) / (float)half;
+}
+
+static void sensor_generate(sensor_t *s, uint32_t tick) {
+    float tw = tri01(tick, 2000u);
+    float hw = tri01(tick, 2600u);
+    uint32_t rng = 0xA5A5u ^ (tick * 2654435761u);
+    float temp = 18.0f + 12.0f * tw + noise_f(&rng, 0.15f);
+    float hum  = 65.0f - 30.0f * hw + noise_f(&rng, 0.40f);
+    if (hum < 0.0f) hum = 0.0f;
+    if (hum > 100.0f) hum = 100.0f;
+    s->temp = temp; s->humidity = hum;
+}
+
+static uint64_t compute_raid_offset(const char *devpath) {
+    if (zinf_ctx->driver == &ram_driver) return (CSV_IMG_SECTS - 2) / zinf_ctx->mirror_count;
+
+    int fd = open(devpath, O_RDONLY);
+    if (fd < 0) { perror("open"); return 30u; }
+
+    uint64_t bytes = 0;
+    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0) {
+        /* Fallback for regular files */
+        off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz > 0) bytes = (uint64_t)sz;
+    }
+    close(fd);
+
+    uint64_t total_sectors = bytes / SECTOR_SIZE;
+    if (total_sectors < 32) return 4u;
+
+    uint64_t usable = total_sectors - 2u;
+    uint64_t offset = (zinf_ctx->mirror_count > 0)
+                      ? (usable / zinf_ctx->mirror_count) : 30u;
+    if (offset < 8u) offset = 8u;
+
+    return offset;
+}
+
+static void wipe_loop_device(const char *dev) {
+    if (zinf_ctx->driver == &ram_driver) {
+        ram_driver_drop_buffer();
+        return;
+    }
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "dd if=/dev/zero of=%s bs=1M count=5 status=none", dev);
+    system(cmd);
+}
+
+static void reset_zinf(const char *dev) {
+    wipe_loop_device(dev);
+
+    zinf_ctx->raid_offset  = compute_raid_offset(dev);
+    zinf_ctx->mirror_offset = zinf_ctx->raid_offset;
+
+    if (setup_storage(zinf_ctx) != STORAGE_OK) {
+        fprintf(stderr, "Storage setup failed\n"); exit(1);
+    }
+    if (init_log_sector(zinf_ctx) != STORAGE_OK) {
+        fprintf(stderr, "Log init failed\n"); exit(1);
+    }
+}
+
+static uint64_t get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* =========================================================
    CLI
    ========================================================= */
 
 #define CLI_MAX_LINE   256
-#define CLI_MAX_TOKENS  32
+#define CLI_MAX_TOKENS  512
 #define SENSOR_WIRE_SIZE 8u
 
 static char   g_line[CLI_MAX_LINE];
@@ -190,8 +278,52 @@ static void cli_rx_char(char c) {
 }
 
 /* =========================================================
-   Utilities
+   Execution Logic
    ========================================================= */
+
+static int run_fill(const char *dev) {
+    zinf_ctx->raid_offset = compute_raid_offset(dev);
+    if (setup_storage(zinf_ctx) != STORAGE_OK) {
+        fprintf(stderr, "Failed to setup storage for %s\n", dev);
+        return 1;
+    }
+
+    printf("Filling %s with synthetic sensor data until full...\n", dev);
+
+    uint64_t start_sector = 0;
+    get_last_sector(zinf_ctx, &start_sector);
+    printf("Starting from logical sector: %llu (RAID offset: %llu)\n", 
+           (unsigned long long)start_sector, (unsigned long long)zinf_ctx->mirror_offset);
+    
+    const int max_records = (int)(PAYLOAD_SIZE / SENSOR_WIRE_SIZE);
+    sensor_t sensors[max_records];
+    uint32_t tick = 0;
+    uint64_t total_records = 0;
+
+    while (1) {
+        for (int i = 0; i < max_records; i++) {
+            sensor_generate(&sensors[i], tick++);
+        }
+        
+        uint8_t rc = raid_sensor_values(zinf_ctx, sensors, (size_t)max_records);
+        
+        if (rc == STORAGE_ERR_FULL) {
+            break;
+        } else if (rc != STORAGE_OK && rc != STORAGE_WARN_DEGRADED) {
+            fprintf(stderr, "\nWrite error rc=%u at record %llu\n", rc, (unsigned long long)total_records);
+            return 1;
+        }
+        
+        total_records += max_records;
+        if (total_records % 1260 == 0) { // Approx every 20 sectors
+            printf("\rWritten %llu records...", (unsigned long long)total_records);
+            fflush(stdout);
+        }
+    }
+
+    printf("\nDone. Total records written: %llu\n", (unsigned long long)total_records);
+    return 0;
+}
 
 static void print_usage(const char *argv0) {
     printf("Usage: %s <command> [device] [options]\n"
@@ -199,6 +331,7 @@ static void print_usage(const char *argv0) {
            "Commands:\n"
            "  format <device>       Format a device or image as ZINF\n"
            "  info   <device>       Show ZINF partition geometry\n"
+           "  fill   [device]       Fill device with synthetic data until full\n"
            "  bench  [device]       Throughput/latency benchmark (CSV to stdout)\n"
            "  shell  [device]       Interactive command shell\n"
            "  help                  Show this help\n"
@@ -215,8 +348,7 @@ static void print_usage(const char *argv0) {
            "  sudo %s format /dev/sdb\n"
            "  %s info /dev/sdb\n"
            "  sudo %s bench /dev/sdb > results.csv\n",
-           argv0,
-           argv0, argv0, argv0);
+           argv0, argv0, argv0, argv0);
 }
 
 static void join_argv(char *out, size_t out_sz, int argc, char **argv, int start) {
@@ -264,86 +396,6 @@ static int run_reader(const char *img) {
 /* =========================================================
    Benchmark
    ========================================================= */
-
-static uint64_t compute_raid_offset(const char *devpath) {
-    if (zinf_ctx->driver == &ram_driver) return (CSV_IMG_SECTS - 2) / zinf_ctx->mirror_count;
-
-    int fd = open(devpath, O_RDONLY);
-    if (fd < 0) { perror("open"); return 30u; }
-
-    uint64_t bytes = 0;
-    if (ioctl(fd, BLKGETSIZE64, &bytes) < 0) { close(fd); return 30u; }
-    close(fd);
-
-    uint64_t total_sectors = bytes / SECTOR_SIZE;
-    if (total_sectors < 32) return 4u;
-
-    uint64_t usable = total_sectors - 2u;
-    uint64_t offset = (zinf_ctx->mirror_count > 0)
-                      ? (usable / zinf_ctx->mirror_count) : 30u;
-    if (offset < 8u) offset = 8u;
-
-    return offset;
-}
-
-static void wipe_loop_device(const char *dev) {
-    if (zinf_ctx->driver == &ram_driver) {
-        ram_driver_drop_buffer();
-        return;
-    }
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "dd if=/dev/zero of=%s bs=1M count=5 status=none", dev);
-    system(cmd);
-}
-
-static void reset_zinf(const char *dev) {
-    wipe_loop_device(dev);
-
-    zinf_ctx->raid_offset  = compute_raid_offset(dev);
-    zinf_ctx->mirror_offset = zinf_ctx->raid_offset;
-
-    if (setup_storage(zinf_ctx) != STORAGE_OK) {
-        fprintf(stderr, "Storage setup failed\n"); exit(1);
-    }
-    if (init_log_sector(zinf_ctx) != STORAGE_OK) {
-        fprintf(stderr, "Log init failed\n"); exit(1);
-    }
-}
-
-static uint64_t get_time_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static inline uint32_t xs32(uint32_t *s) {
-    uint32_t x = *s;
-    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-    *s = x; return x;
-}
-static inline float noise_f(uint32_t *s, float amp) {
-    uint32_t r = xs32(s) & 0xFFFFu;
-    return (((float)r / 32767.5f) - 1.0f) * amp;
-}
-static inline float tri01(uint32_t phase, uint32_t period) {
-    if (!period) return 0.0f;
-    uint32_t p = phase % period, half = period / 2u;
-    if (!half) return 0.0f;
-    return (p < half) ? (float)p / (float)half
-                       : (float)(period - p) / (float)half;
-}
-
-static void sensor_generate(sensor_t *s, uint32_t tick) {
-    float tw = tri01(tick, 2000u);
-    float hw = tri01(tick, 2600u);
-    uint32_t rng = 0xA5A5u ^ (tick * 2654435761u);
-    float temp = 18.0f + 12.0f * tw + noise_f(&rng, 0.15f);
-    float hum  = 65.0f - 30.0f * hw + noise_f(&rng, 0.40f);
-    if (hum < 0.0f) hum = 0.0f;
-    if (hum > 100.0f) hum = 100.0f;
-    s->temp = temp; s->humidity = hum;
-}
 
 static int run_benchmark(int random_payload, int jitter_us, int pre_degraded) {
     const char *dev = g_device;
@@ -498,12 +550,19 @@ int main(int argc, char **argv) {
 
     const char *mode = argv[mode_idx];
     if (strcmp(mode, "bench") == 0) return run_benchmark(random_payload, jitter_us, pre_degraded);
+    if (strcmp(mode, "fill") == 0) {
+        const char *dev = (argc > mode_idx + 1) ? argv[mode_idx + 1] : g_device;
+        if (!use_ram) linux_driver_set_path(dev);
+        return run_fill(dev);
+    }
     if (strcmp(mode, "format") == 0) {
         const char *dev = (argc > mode_idx + 1) ? argv[mode_idx + 1] : g_device;
+        if (!use_ram) linux_driver_set_path(dev);
         return run_format(dev);
     }
     if (strcmp(mode, "info") == 0) {
         const char *dev = (argc > mode_idx + 1) ? argv[mode_idx + 1] : g_device;
+        if (!use_ram) linux_driver_set_path(dev);
         return run_reader(dev);
     }
     if (strcmp(mode, "shell") == 0 || strcmp(mode, "cli") == 0)

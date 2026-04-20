@@ -17,24 +17,24 @@ This roadmap details the architectural pivot to a **Boxed Appliance Model**, exp
 ZINF Studio will replace the Linux CLI for the average researcher, ensuring a frictionless experience from day one.
 
 ### 1.1 The "One-Script" Installer
-Researchers will only need to run a single installation script (or install the app package). This script will automatically handle all underlying dependencies, install the Tauri app, set up necessary udev rules, and prepare the environment. 
+Researchers will only need to run a single installation script (or install the app package). This script automatically handles underlying dependencies, installs the **ZINF Studio (Tauri 2)** app, sets up necessary udev rules, and prepares the environment. 
 *   **Current Target:** Linux-first (optimized for standard research environments).
-*   **Future Targets:** Windows and macOS support will follow once the Linux foundation is solid.
-*   **Seamless Updates:** The installer and the Tauri app will feature built-in, easy update mechanisms to pull the latest ZINF features without requiring manual recompilation of tools.
+*   **Aesthetic:** "Retro Creamy" high-readability light theme (Classic Hardware beige).
 
 ### 1.2 Architecture & Technology Stack
-*   **Frontend:** SvelteKit + TailwindCSS. Provides a responsive, dual-view interface (Visual Configurator ↔ Raw YAML Editor).
+*   **Frontend:** Svelte 5 + Tailwind 4. Provides a responsive, dual-view interface (Visual Configurator ↔ Raw YAML Editor).
 *   **Backend:** Rust (Tauri Core). Wraps the existing ZINF C library via FFI (Foreign Function Interface) to reuse `raid_read()`, `zinf_crc32()`, and the `zinf_ctx_t` parsing logic.
-*   **Hardware Bridge:** Rust native libraries to detect ZINF-formatted block devices *before* the host OS attempts to mount them.
+*   **Typography:** JetBrains Mono for optimal data legibility.
 
 ### 1.3 The YAML Configuration Core
-The `zinf.yaml` file remains the absolute source of truth. The Visual Configurator acts as a friendly wrapper around it, allowing researchers to define payload structures (`sensor_t`), adjust `mirror_count`, and calculate `PAYLOAD_SIZE` visually, while preserving the raw YAML for advanced users and version control.
+The `zinf.yaml` file remains the absolute source of truth. The Visual Configurator acts as a friendly wrapper around it, allowing researchers to define payload structures (`sensor_t`), adjust `mirror_count`, and calculate `PAYLOAD_SIZE` visually, with real-time bidirectional synchronization between GUI and Raw YAML.
 
-### 1.4 One-Click Data Extraction & Recovery
+### 1.4 One-Click Data Extraction & Offline Preview
 *   **Raw Sector Reads:** Direct block reads bypassing standard OS filesystems.
 *   **RAID Verification:** Runs `raid_read()` across all mirrors applying majority voting.
 *   **CSV Export:** Automatically serializes the wire format into timestamped `.csv` files.
-*   **Scrubbing:** Exposes a "Verify Data Integrity" button that runs `zinf_scrub()`.
+*   **Offline Preview:** Load and preview previously exported `.csv` files directly in the Explorer tab without hardware connection.
+*   **Scrubbing:** Exposes a "Verify Integrity" button that runs `zinf_scrub()`.
 
 ---
 

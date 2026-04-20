@@ -116,6 +116,32 @@ zinf:
 
 ---
 
+## Visual Configuration (ZINF Studio)
+
+ZINF Studio provides an advanced **Configurator** tab that serves as a graphical frontend for `zinf.yaml`.
+
+### Bidirectional Synchronization
+The **Visual Editor** and the **Raw YAML Editor** are linked in real-time. Changes made to sliders or dropdowns instantly update the YAML text, and manual edits to the YAML are automatically parsed back into the visual controls.
+
+### Global Settings
+- **Mirror Redundancy**: Visual slider to set `mirror_count` (1, 3, or 5).
+- **Sector Geometry**: Selectable hardware alignment (512, 1024, 4096 bytes).
+- **Metadata Allocation**: Slider for `metadata_sectors`.
+- **Header Size**: Input for `header_size` (1–4 bytes).
+- **Blacklist Capacity**: Slider for `max_bad_sectors` (16–256).
+
+### Data Schema Editor
+Instead of manually typing YAML, users can use the **Data Schemas** panel to:
+1. **Add/Remove Structs**: Create new `data_types` with a single click.
+2. **Define Wire Fields**: Add fields to structs and select their wire types (float, double, i16, u16, i32, u32, u8) from a dropdown.
+
+### File Operations
+- **Import YAML**: Load an existing `.yaml` or `.yml` file into the editor.
+- **Export YAML**: Save the current configuration to a local file.
+- **Regenerate C API**: Clicking **[ Regenerate C API ]** writes the local `zinf.yaml` and triggers `zinf_gen.py` to update the C header and source files automatically.
+
+---
+
 ## `sensor_t` Struct
 
 ```c

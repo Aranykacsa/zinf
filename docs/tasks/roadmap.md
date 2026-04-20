@@ -24,6 +24,7 @@ This document is derived from the thesis *"Mérésadatgyűjtésre optimalizált 
 | RAID read path with CRC verification + fallback + majority voting | Done |
 | Bad-sector blacklist (`zinf_mark_bad_sector`, `zinf_scrub`) | Done |
 | Automated fault-injection test suite (28 unit + 172 CSV scenarios) | Done |
+| **Desktop GUI (ZINF Studio)** | **Done** |
 | First real deployment (Mimike-II Rev-I CanSat) | Done |
 
 ---
@@ -183,41 +184,20 @@ The Makefile runs the generator before compilation if the YAML is newer than the
 
 ---
 
-### F3 — Desktop GUI (Tauri + Svelte) — In Progress
+### F3 — Desktop GUI (ZINF Studio) ✓ Done
 
 **Thesis reference:** §8.3
 
-A platform-independent desktop application for configuring ZINF and reading back stored data.
+A cross-platform desktop application (Tauri 2 + Svelte 5 + Tailwind 4) for configuring ZINF, extracting data, and verifying integrity.
 
-**Plan:**
+**Features Implemented:**
+- **Tabbed SPA Layout**: Clean navigation between Explorer, Configurator, and SDK Generator.
+- **Retro Creamy Theme**: Eye-friendly "Classic Hardware" aesthetic with JetBrains Mono for optimal data legibility.
+- **Explorer Tab**: Real-time hardware extraction, RAID majority verification, and **Offline CSV Preview**.
+- **Advanced Configurator**: Bidirectional synchronization between visual sliders/dynamic schema editor and raw `zinf.yaml`.
+- **SDK Generator**: Guided integration wizard with compiler-guarded templates.
 
-```
-zinf-gui/              (new top-level directory)
-├── src-tauri/         (Rust backend)
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── commands.rs    — Tauri commands wrapping zinf C library via FFI
-│   │   └── reader.rs      — RAID read + CSV export
-│   └── Cargo.toml
-├── src/               (Svelte frontend)
-│   ├── App.svelte
-│   ├── views/
-│   │   ├── ConfigGui.svelte    — graphical parameter editor
-│   │   └── YamlEditor.svelte  — YAML editor with syntax highlighting
-│   └── lib/
-└── package.json
-```
-
-**Two views (dual-view, thesis §8.3):**
-1. **Graphical GUI** — visual sliders and dropdowns for sector size, mirror count, data type fields
-2. **YAML editor** — raw YAML with syntax highlighting, synced live with the GUI view
-
-**Tauri backend exposes:**
-- `read_image(path, raid_offset, mirrors)` → JSON array of records
-- `write_config(yaml_text)` → generates and validates config
-- `export_csv(path)` → calls the reader logic and saves CSV
-
-**Files:** New `zinf-gui/` directory. No changes to `src/`.
+**Files:** `zinf-studio/` directory.
 
 ---
 

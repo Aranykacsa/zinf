@@ -7,38 +7,31 @@ ZINF Studio is a cross-platform desktop application that replaces the CLI for re
 
 ## UI Layout (Polished MVP)
 
-Three-panel layout using TailwindCSS:
+Single-page application with a tabbed layout using Svelte 5 and Tailwind 4:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  ZINF Studio                                    [⚙ Config] │
-├──────────────┬─────────────────────────────────────────────┤
-│ Devices      │  Sector Data / CSV Preview                  │
-│              │                                             │
-│ /dev/sdb     │  sector | index | field_0 | field_1 ...  │
-│   zinf v4    │  0      | 0     | 23.50   | 65.00   ...  │
-│ /dev/sdc     │  0      | 1     | 23.51   | 64.99   ...  │
-│              │  ...                                        │
-│ [Scan]       │                                             │
-│              │  [Extract to CSV]  [Verify Integrity]       │
-└──────────────┴─────────────────────────────────────────────┘
-```
+**HeaderBar (GNOME HIG inspired):**
+- App Title: **ZINF Studio**
+- **Segmented Control** for top-level navigation:
+  - **Explorer**: Device data browsing and extraction.
+  - **Configurator**: Visual YAML editor.
+  - **SDK Generator**: Guided integration wizard.
+- Aesthetic: **"Retro Creamy"** light theme (Classic Hardware beige) with **JetBrains Mono** for optimal data legibility.
 
-**Left sidebar — Device List:**
-- `scan_zinf_devices()` populates a list of detected ZINF block devices.
-- Each entry shows: device path + format version (read from sector 0 magic bytes).
-- `[Scan]` button re-runs the scan.
-- Selecting a device loads a preview of the first N sectors into the main panel.
+**Explorer Tab:**
+- **Sidebar**: Populated by `scan_devices()`. Shows device path and format version.
+- **Main View**: 
+  - Real-time extraction table with one row per record.
+  - **Offline Preview**: Load and preview previously exported `.csv` files.
+- **Action Bar**: [ Verify Integrity ] and [ Extract Data ] buttons.
 
-**Main panel — Data Preview:**
-- Table with one row per logical sector, one column per sensor field defined in `zinf.yaml`.
-- Column headers are the `name` values from `zinf.yaml` `data_types[0].fields`.
-- Rows stream in via Tauri events as sectors are read; show a loading indicator while in progress.
+**Configurator Tab:**
+- **Visual Editor**: Sliders for mirror redundancy and geometry. Dynamic editor for structs and fields.
+- **Raw YAML**: Syntax-highlighted editor synced bidirectionally with the Visual tab.
+- **File Ops**: Import/Export YAML functionality.
 
-**Settings drawer (⚙ Config button):**
-- Opens a right-side drawer.
-- Two tabs: **Visual** (dropdowns/sliders for `mirror_count`, `sector_size`, `metadata_sectors`) and **YAML** (raw editor with syntax highlighting, synced live with the Visual tab).
-- "Save & Regenerate" button calls `generate_config(yaml_text)` which writes `zinf.yaml` and re-runs `zinf_gen.py`.
+**SDK Generator Tab:**
+- **Integration Wizard**: Generates compiler-guarded C templates based on the current `zinf.yaml`.
+- **Target Selection**: Bus protocol (SPI, I2C, UART) and custom ID configuration.
 
 ---
 
@@ -137,10 +130,10 @@ Wire format is the same as `sensor_to_wire()` in `api.c`: each `float` is 4 byte
 
 ## Deliverables Checklist
 
-- [ ] `zinf-studio/` Tauri project initialized
-- [ ] `build.rs` compiles C sources + generates bindings
-- [ ] `hardware.rs` — `scan_zinf_devices`, `open_device`
-- [ ] `commands.rs` — `extract_data`, `verify_integrity`, `generate_config`
-- [ ] SvelteKit frontend — device sidebar, data table, settings drawer
-- [ ] `zinf.yaml` parsed at runtime for column names
-- [ ] Tauri events for progress streaming
+- [x] `zinf-studio/` Tauri project initialized
+- [x] `build.rs` compiles C sources + generates bindings
+- [x] `hardware.rs` — `scan_zinf_devices`, `open_device`
+- [x] `commands.rs` — `extract_data`, `verify_integrity`, `generate_config`, `preview_csv`
+- [x] Svelte 5 frontend — "Retro Creamy" tabbed SPA
+- [x] Bidirectional YAML / Visual Config sync
+- [x] Tauri events for progress streaming

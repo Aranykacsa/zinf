@@ -6,7 +6,7 @@ use crate::zinf_ffi::{
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{BufRead, Write as IoWrite};
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
@@ -75,23 +75,26 @@ pub struct ZinfYamlConfig {
     pub mirror_count: u8,
     #[serde(default = "default_metadata_sectors")]
     pub metadata_sectors: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub header_size: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_bad_sectors: Option<u32>,
+    #[serde(default = "default_header_size")]
+    pub header_size: u8,
+    #[serde(default = "default_max_bad_sectors")]
+    pub max_bad_sectors: u32,
     pub data_types: Vec<YamlDataType>,
 }
 
 fn default_metadata_sectors() -> u8 { 2 }
+fn default_header_size() -> u8 { 1 }
+fn default_max_bad_sectors() -> u32 { 64 }
+
+#[derive(Serialize, Deserialize)]
+struct ZinfYamlRoot {
+    zinf: ZinfYamlConfig,
+}
 
 /// Parse zinf config from either the nested `zinf: { ... }` format used by
 /// zinf.yaml on disk, or the flat format used by the frontend's built-in fallback.
 fn parse_zinf_config(yaml_text: &str) -> Result<ZinfYamlConfig, String> {
-    // Wrapper matching the on-disk zinf.yaml structure: `zinf: { sector_size: … }`
-    #[derive(serde::Deserialize)]
-    struct Root { zinf: ZinfYamlConfig }
-
-    if let Ok(root) = serde_yaml::from_str::<Root>(yaml_text) {
+    if let Ok(root) = serde_yaml::from_str::<ZinfYamlRoot>(yaml_text) {
         return Ok(root.zinf);
     }
     // Fall back to flat format (frontend default / user-edited)
@@ -102,6 +105,53 @@ fn parse_zinf_config(yaml_text: &str) -> Result<ZinfYamlConfig, String> {
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
+
+/// Parse YAML text into a structured config object for the frontend.
+#[tauri::command]
+pub fn get_config(yaml_text: String) -> Result<ZinfYamlConfig, String> {
+    parse_zinf_config(&yaml_text)
+}
+
+/// Serialize a config object back into a YAML string (nested under `zinf:`).
+#[tauri::command]
+pub fn serialize_config(config: ZinfYamlConfig) -> Result<String, String> {
+    let root = ZinfYamlRoot { zinf: config };
+    serde_yaml::to_string(&root).map_err(|e| format!("YAML serialization error: {e}"))
+}
+
+/// Read first 1000 lines of a ZINF-exported CSV to preview offline.
+#[tauri::command]
+pub fn preview_csv(path: String) -> Result<(Vec<String>, Vec<SectorRow>), String> {
+    let file = fs::File::open(&path).map_err(|e| format!("Cannot open CSV: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    let mut lines = reader.lines();
+
+    // Read header
+    let header_line = lines.next()
+        .ok_or("CSV is empty")?
+        .map_err(|e| e.to_string())?;
+    let headers: Vec<String> = header_line.split(',')
+        .skip(2) // Skip sector, index
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut rows = Vec::with_capacity(1000);
+    for line_res in lines.take(1000) {
+        let line = line_res.map_err(|e| e.to_string())?;
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() < 2 { continue; }
+        
+        let sector = parts[0].parse::<u64>().unwrap_or(0);
+        let index = parts[1].parse::<usize>().unwrap_or(0);
+        let values: Vec<f64> = parts.iter().skip(2)
+            .map(|s| s.trim().parse::<f64>().unwrap_or(0.0))
+            .collect();
+            
+        rows.push(SectorRow { sector, index, values });
+    }
+
+    Ok((headers, rows))
+}
 
 /// Scan block devices for ZINF magic and return matching device list.
 #[tauri::command]
