@@ -1,3 +1,11 @@
+---
+id: demo-data
+title: Demo Data
+sidebar_label: Demo Data
+sidebar_position: 10
+description: Create a loopback device and populate it with synthetic sensor data for testing.
+---
+
 # Creating a ZINF Demo Loopback Device
 
 This guide describes how to create a loopback device and populate it with synthetic sensor data for testing purposes.

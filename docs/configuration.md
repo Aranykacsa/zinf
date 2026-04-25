@@ -1,3 +1,11 @@
+---
+id: configuration
+title: Configuration
+sidebar_label: Configuration
+sidebar_position: 5
+description: Compile-time constants, zinf.yaml master config, and zinf_ctx_t field reference.
+---
+
 # Configuration
 
 ## Compile-Time Constants (`config/config.h`)

@@ -1,3 +1,11 @@
+---
+id: fault-testing
+title: Fault Injection Testing
+sidebar_label: Fault Testing
+sidebar_position: 3
+description: Massive-scale fuzz engine — 1,000,000+ randomised fault iterations against the ZINF storage stack.
+---
+
 # Fault Injection Test System
 
 The fault test suite (`tests/test_fault_csv.c`) is a massive-scale continuous-state fuzzer that executes millions of randomized operations against the ZINF storage stack, injects hardware faults mid-run, and verifies that the RAID, CRC, blacklist, and recovery paths behave correctly under sustained adversarial conditions.

@@ -1,3 +1,11 @@
+---
+id: api-reference
+title: API Reference
+sidebar_label: API Reference
+sidebar_position: 6
+description: All public functions with signatures, parameters, and return codes.
+---
+
 # API Reference
 
 All public headers are under `src/core/` and `src/config/`. Include paths are configured in the Makefile so files can be included by short name (e.g. `#include "api.h"`).

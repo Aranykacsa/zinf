@@ -1,3 +1,11 @@
+---
+id: architecture
+title: Architecture
+sidebar_label: Architecture
+sidebar_position: 3
+description: Layer design, RAID layout, storage efficiency, and data flows.
+---
+
 # Architecture
 
 ## System Overview
@@ -73,7 +81,7 @@ Core logic for:
 Generated from `zinf.yaml` by `tools/zinf_gen.py`. Provides compile-time constants, the `sensor_t` struct, serialization functions (`sensor_t_to_wire`), and `zinf_ctx_t`. No global mutable state — all runtime state is in `zinf_ctx_t`.
 
 ### 6. Driver Layer (`drivers/`)
-Platform-specific block I/O. The `driver` field in `zinf_ctx_t` routes all reads/writes to the correct backend.
+Platform-specific block I/O. The `driver` field in `zinf_ctx_t` routes all reads/writes to the correct backend. This separation is a deliberate design boundary: the logical layer (addressing, RAID, CRC) never touches hardware directly — it only calls the three-function `driver_t` interface (`init`, `read_block`, `write_block`). Porting ZINF to a new target means implementing those three functions; nothing else changes.
 
 | Driver | Path | Use |
 |---|---|---|
@@ -130,29 +138,52 @@ Sector N+1+OFFSET   → Data chunk 1, Mirror 1
 `mirror_offset` / `raid_offset` is computed at runtime from the actual device size and stored in `zinf_ctx_t`:
 
 ```
-total_sectors = device_bytes / sector_size
-usable        = total_sectors - metadata_sectors
-mirror_offset = usable / mirror_count
-minimum       = 8  (enforced lower bound)
+mirror_offset = floor((total_sectors - metadata_sectors) / mirror_count),  min = 8
 ```
 
 For a 5 MB device (10240 sectors, mirror_count=2, metadata_sectors=2):
 ```
+total_sectors = 10240
 usable        = 10238
 mirror_offset = 5119
 ```
 
 ### Physical Address Formula
 
-For logical chunk index `i` and mirror number `m` (0-based):
+For logical chunk index `i` and mirror index `m` (0-based, `m ∈ {0 … mirror_count-1}`):
 
 ```
-physical_sector = (last_log_index + 1 + i) + m * mirror_offset
+physical_sector = base_cursor + i + m * mirror_offset
 ```
+
+where `base_cursor = last_log_index + 1`. This formula ensures that copies of the same logical data are placed as far apart as possible on the storage medium, so a localised write fault cannot corrupt more than one mirror simultaneously.
 
 ### Majority Voting (3+ mirrors)
 
 `raid_read` collects CRC-valid copies from all mirrors and counts how many match byte-for-byte. A copy wins if it appears more than `mirror_count / 2` times. If no majority is found, `STORAGE_ERR_UNRECOVERABLE` is returned — callers must handle degraded reads explicitly.
+
+---
+
+## Storage Efficiency
+
+Because ZINF writes in fixed-size sectors (512 bytes), the last sector of a block may not fill completely if the record size does not divide evenly into the payload size. The maximum waste per write is:
+
+```
+max_waste = record_size - 1  [bytes]
+```
+
+**Example — 14-byte record** (`float temp, humidity` + `int16_t ax, ay, az`):
+
+| Level | Calculation | Result |
+|---|---|---|
+| Records per sector | floor(512 / 14) | 36 records |
+| Useful bytes per sector | 36 × 14 | 504 bytes |
+| Wasted bytes per sector | 512 − 504 | **8 bytes** |
+| Sectors until 1 MiB wasted | 1 048 576 / 8 | 131 072 sectors |
+| Useful data stored by then | 131 072 × 504 B | **≈ 63 MiB** |
+| Storage efficiency | 63 / (63 + 1) | **≈ 98.44 %** |
+
+The 1.56 % capacity overhead is the inherent cost of safe, block-based, deterministic writes. The ratio depends on the chosen record size.
 
 ---
 

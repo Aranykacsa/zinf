@@ -1,3 +1,11 @@
+---
+id: fuzz-analysis
+title: Fuzz Analysis
+sidebar_label: Fuzz Analysis
+sidebar_position: 4
+description: What the failure rate means, baseline results, and how to distinguish real bugs from expected adversarial behaviour.
+---
+
 # Fuzz Analysis — Interpreting Massive-Scale Test Results
 
 This document explains how to read the output of `run_fault_csv -M`, what the numbers mean, and what counts as a real bug versus expected behaviour under adversarial conditions.

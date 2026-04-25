@@ -1,3 +1,11 @@
+---
+id: embedded-porting
+title: Embedded Porting Guide
+sidebar_label: Embedded Porting
+sidebar_position: 8
+description: SPI wiring, CMakeLists.txt, and first-boot initialization for RP2350/Pico.
+---
+
 # Embedded Porting Guide
 
 This guide covers compiling ZINF for a microcontroller, wiring the SD card driver to platform SPI, and first-boot initialization. The RP2350 (Raspberry Pi Pico 2) with a SPI-mode SD card is used as the concrete example throughout, but the approach applies to any Cortex-M target.

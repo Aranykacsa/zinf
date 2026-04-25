@@ -1,4 +1,26 @@
+---
+id: getting-started
+title: Getting Started
+sidebar_label: Getting Started
+sidebar_position: 2
+description: Build, install, format a device, and run ZINF for the first time.
+---
+
 # Getting Started
+
+## Why ZINF?
+
+Research and data-acquisition systems must record large volumes of measurements in environments where power, memory, and storage reliability are severely constrained — think satellites, polar monitoring stations, or autonomous sensor platforms running without human supervision.
+
+General-purpose filesystems (FAT32, ext4, LittleFS, SPIFFS) are unsuitable here for three reasons:
+
+- **Non-deterministic timing** — garbage collection and journaling introduce unpredictable write latencies that break real-time guarantees.
+- **Poor crash tolerance** — partial writes can leave metadata in an inconsistent state that requires expensive repair (`fsck`) or causes silent data loss.
+- **Unnecessary complexity** — directory trees, permission bits, and large metadata structures waste RAM and flash on microcontrollers.
+
+ZINF is designed around the opposite set of constraints: write latency is bounded by `mirror_count × T_sector_write`, every sector carries a CRC-32, and RAID-1 mirroring with majority voting makes single-sector bit-rot detectable and correctable without any offline repair step.
+
+---
 
 ## Install
 
@@ -112,7 +134,7 @@ sudo zinf bench /dev/sdb > results.csv
 ```
 
 Outputs a CSV with throughput and latency columns for a range of payload sizes.
-See [Benchmarking](benchmarking.md) for details.
+See [Benchmarking](testing/benchmarking.md) for details.
 
 ---
 

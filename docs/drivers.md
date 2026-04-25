@@ -1,3 +1,11 @@
+---
+id: drivers
+title: Drivers
+sidebar_label: Drivers
+sidebar_position: 7
+description: The driver_t interface, Linux, SD card, and mock driver implementations.
+---
+
 # Drivers
 
 ## The `driver_t` Interface (`core/helper/driver.h`)

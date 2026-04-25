@@ -1,3 +1,11 @@
+---
+id: realistic-test
+title: Realistic Lifecycle Test
+sidebar_label: Lifecycle Test
+sidebar_position: 5
+description: End-to-end data integrity test with power cycles, scrub recovery, and fault injection.
+---
+
 # Realistic Lifecycle Test — Running and Interpreting Results
 
 The realistic test (`tests/test_realistic.c`) simulates a full embedded device lifetime: continuous

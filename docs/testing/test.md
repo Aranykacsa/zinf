@@ -1,3 +1,11 @@
+---
+id: test-overview
+title: Testing Overview
+sidebar_label: Overview
+sidebar_position: 1
+description: All ZINF test suites at a glance — unit tests, fault injection, CLI, and benchmark.
+---
+
 # Testing
 
 ## 1. Unit + fault-injection tests (no hardware needed)

@@ -1,3 +1,11 @@
+---
+id: advanced-test
+title: Advanced Test Suite
+sidebar_label: Advanced Tests
+sidebar_position: 6
+description: 11 targeted edge-case scenarios covering storage wipe, degraded write, metadata corruption, version wraparound, and more.
+---
+
 # Advanced Test Suite — Running and Interpreting Results
 
 The advanced test (`tests/test_advanced.c`) is a benchmark-grade regression suite covering eleven

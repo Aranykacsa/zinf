@@ -1,3 +1,11 @@
+---
+id: benchmarking
+title: Benchmarking
+sidebar_label: Benchmarking
+sidebar_position: 2
+description: Running the ZINF benchmark and interpreting throughput and latency results.
+---
+
 # Benchmarking
 
 ## Running the Benchmark

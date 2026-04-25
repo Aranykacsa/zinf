@@ -1,3 +1,12 @@
+---
+id: intro
+title: ZINF — Zinf is not FAT
+sidebar_label: Introduction
+sidebar_position: 1
+slug: /
+description: Lightweight RAID-mirrored data logging library for IoT and embedded systems.
+---
+
 # ZINF — Zinf is not FAT
 
 ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded systems. It provides reliable persistent storage with built-in redundancy and CRC32 data integrity for sensor data and arbitrary byte sequences.

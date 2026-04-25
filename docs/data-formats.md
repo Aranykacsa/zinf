@@ -1,3 +1,11 @@
+---
+id: data-formats
+title: Data Formats
+sidebar_label: Data Formats
+sidebar_position: 4
+description: Sector, metadata, and sensor wire layouts with byte-level field references.
+---
+
 # Data Formats
 
 ## Sector Layout (512 bytes)
@@ -76,7 +84,15 @@ Total message log capacity: 471 + 512 = **983 bytes** (`MSG_LOG_TOTAL_CAP`)
 
 Three copy slots each record the `last_sector` LBA and a monotonic 16-bit version counter.
 On each metadata write, the next copy slot is chosen in round-robin order and its version incremented by one.
-The slot with the highest version (using modular comparison to handle 0xFFFF → 0x0000 wraparound) is the authoritative copy.
+The slot with the highest version is the authoritative copy.
+
+Comparison uses modular arithmetic to handle 0xFFFF → 0x0000 wraparound correctly:
+
+```
+V_new is newer than V_old  iff  (V_new - V_old) mod 2^16 < 2^15
+```
+
+This guarantees that the most recent consistent state is always recoverable even if power is lost mid-write — a partially-written slot will have an invalid or stale version and will be ignored during recovery.
 
 ---
 

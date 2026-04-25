@@ -1,3 +1,11 @@
+---
+id: studio-usage
+title: ZINF Studio Guide
+sidebar_label: ZINF Studio
+sidebar_position: 9
+description: Explorer, Configurator, and SDK Generator tabs — complete usage guide.
+---
+
 # ZINF Studio Usage Guide
 
 ZINF Studio is the primary desktop appliance for researchers and hardware developers. It provides a high-readability "Retro Creamy" interface for managing ZINF-formatted devices, configuring data schemas, and generating integration code.
