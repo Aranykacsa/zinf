@@ -16,19 +16,24 @@ ZINF (Zinf Is Not FAT) is a lightweight, RAID-mirrored data logging library desi
 ZINF Studio is a cross-platform (Tauri-based) desktop application for researchers and developers. It allows for "zero-code" data extraction and hardware configuration.
 
 ### Prerequisites
-- **Node.js & npm** (v18+)
-- **Rust & Cargo** (Latest stable)
-- **Linux Build Tools** (gcc, make, pkg-config, etc.)
+- **Bun** (Fast JavaScript runtime, replaces Node/npm)
+- **Rust & Cargo** (Install via `rustup`)
+- **Linux Build Tools & Tauri Dependencies**:
+  - **Fedora:** ```bash
+    sudo dnf install webkit2gtk4.1-devel gtk3-devel glib2-devel librsvg2-devel openssl-devel libappindicator-gtk3-devel
+    ```
+  - **Ubuntu/Debian:** *(See Tauri documentation for `apt` equivalents)*
 
 ### Build and Install
-Run the following command from the repository root:
+
+**Important:** Do NOT run the build process as `root` (e.g., avoid `sudo make install-studio`). Doing so will assign your project files to the root user and break future builds. 
+
+Run the following command from the repository root as your normal user:
 ```bash
-make install-studio
+# Modern Linux distributions (like Fedora 40+) use FUSE 3, which can break AppImage bundling. 
+# The environment variable below safely bypasses this issue:
+APPIMAGE_EXTRACT_AND_RUN=1 make install-studio
 ```
-This will:
-1. Build the Tauri application.
-2. Install the `zinf-studio` binary to `/usr/local/bin`.
-3. Configure `udev` rules to grant your user (`plugdev` group) access to ZINF-formatted devices without `sudo`.
 
 ---
 
