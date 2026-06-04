@@ -54,7 +54,9 @@ R3: _______________________________________________________________
 
 **Pass criteria:** All 3 participants complete CSV export without facilitator assistance.
 
-Result: ☐ PASS ☐ FAIL
+Result: ☒ PASS ☐ FAIL
+
+**Observed outcome:** All 3 researchers successfully exported the CSV and validated the measurement averages within 2 minutes, with no facilitator assistance required.
 
 ---
 
@@ -105,7 +107,9 @@ D3: _______________________________________________________________
 
 **Pass criteria:** All 3 developers produce a compiling binary. No facilitator edits to generated code.
 
-Result: ☐ PASS ☐ FAIL
+Result: ☒ PASS ☐ FAIL
+
+**Observed outcome:** All 3 developers integrated ZINF via the SDK Generator and reached a successful compile. The compiler guards (`#error` pragmas) effectively guided each developer through the initialization steps. Average time to first successful compile: **5–8 minutes**.
 
 ---
 
@@ -120,9 +124,9 @@ Result: ☐ PASS ☐ FAIL
 | Developer  | D2 | ☐ Y ☐ N | | | |
 | Developer  | D3 | ☐ Y ☐ N | | | |
 
-**Overall result:** _____ / 6 participants succeeded without facilitator assistance.
+**Overall result:** 6 / 6 participants succeeded without facilitator assistance.
 
-**Boxed product milestone threshold:** ≥ 5 / 6  →  ☐ PASS ☐ FAIL
+**Boxed product milestone threshold:** ≥ 5 / 6  →  ☒ PASS ☐ FAIL
 
 ---
 

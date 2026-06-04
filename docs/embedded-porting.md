@@ -10,6 +10,8 @@ description: SPI wiring, CMakeLists.txt, and first-boot initialization for RP235
 
 This guide covers compiling ZINF for a microcontroller, wiring the SD card driver to platform SPI, and first-boot initialization. The RP2350 (Raspberry Pi Pico 2) with a SPI-mode SD card is used as the concrete example throughout, but the approach applies to any Cortex-M target.
 
+> **Production history:** ZINF's first real-world deployment used an **ATSAMD21G18AU** (ARM Cortex-M0+) on the Mimike-II Rev-I CanSat (Juhász Jenő Szakkollégium CosMIK, 2025). The RP2350 became the primary reference target in later development. The portable core compiled unchanged for both MCUs.
+
 ---
 
 ## Portable Core

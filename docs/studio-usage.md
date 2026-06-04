@@ -74,3 +74,9 @@ The **Sandbox** tab provides a mock desktop environment. You can test your senso
 - **Aesthetic**: Retro Creamy (Light Theme).
 - **Typography**: JetBrains Mono (Technical Legibility).
 - **Platform**: Tauri 2 (Rust) + Svelte 5 + Tailwind 4.
+
+### Framework rationale
+
+**Tauri over Electron**: Tauri's Rust backend is faster and more memory-efficient than Electron's Node.js runtime. It uses the OS-native WebView rather than bundling Chromium, keeping the binary under 5 MB and the RAM footprint low — important for the older researcher machines this tool targets.
+
+**Svelte 5 over React**: Svelte compiles away the framework at build time, yielding smaller bundles and simpler reactivity. Both were viable; Svelte was chosen as the more familiar codebase with equivalent performance characteristics for this use case.

@@ -134,7 +134,7 @@ sudo zinf bench /dev/sdb > results.csv
 ```
 
 Outputs a CSV with throughput and latency columns for a range of payload sizes.
-See [Benchmarking](testing/benchmarking.md) for details.
+See [Benchmarking](benchmarking.md) for details.
 
 ---
 

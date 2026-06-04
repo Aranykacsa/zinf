@@ -11,6 +11,11 @@ description: Lightweight RAID-mirrored data logging library for IoT and embedded
 
 ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded systems. It provides reliable persistent storage with built-in redundancy and CRC32 data integrity for sensor data and arbitrary byte sequences.
 
+Source code: [github.com/Aranykacsa/zinf](https://github.com/Aranykacsa/zinf)  
+Documentation: [zinf.zalanvdsz.hu](https://zinf.zalanvdsz.hu)
+
+ZINF has been deployed in production on the **Mimike-II Rev-I CanSat** (Juhász Jenő Szakkollégium CosMIK group, 2025), collecting UV intensity, 9-axis accelerometer, temperature, and GNSS data during high-altitude balloon flights. The same core is applicable to CubeSat-class payloads, industrial sensor networks, autonomous robotics, and any mission-critical embedded data logger.
+
 ## Key Features
 
 - **RAID-1 mirroring** — two on-disk copies of every write for single-failure tolerance
@@ -33,11 +38,11 @@ ZINF is a lightweight, RAID-mirrored data logging library for IoT and embedded s
 | [Drivers](drivers.md) | `driver_t` interface and platform implementations |
 | [Configuration](configuration.md) | Constants, structs, and runtime settings |
 | [Benchmarking](benchmarking.md) | Running the benchmark and interpreting results |
-| [Testing Overview](testing/test.md) | All test suites at a glance — unit tests, fault injection, CLI, benchmark |
-| [Fault Testing](testing/fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
-| [Fuzz Analysis](testing/fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
-| [Realistic Lifecycle Test](testing/realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
-| [Advanced Test Suite](testing/advanced-test.md) | 11 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O, repair cycle, msg-log interleave, disk full, double fault |
+| [Testing Overview](test.md) | All test suites at a glance — unit tests, fault injection, CLI, benchmark |
+| [Fault Testing](fault-testing.md) | Massive-scale fuzz engine — running and understanding results |
+| [Fuzz Analysis](fuzz-analysis.md) | What the failure rate means, baseline results, how to spot real bugs |
+| [Realistic Lifecycle Test](realistic-test.md) | End-to-end data integrity test with power cycles, scrub recovery, and fault injection |
+| [Advanced Test Suite](advanced-test.md) | 11 targeted edge-case scenarios: storage wipe, degraded write, blacklist overflow, metadata corruption, version wraparound, full-range scrub, loopback I/O, repair cycle, msg-log interleave, disk full, double fault |
 | [Embedded Porting Guide](embedded-porting.md) | SPI wiring, CMakeLists.txt, and first-boot init for RP2350/Pico |
 
 ## Repository Layout
